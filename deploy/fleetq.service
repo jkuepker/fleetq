@@ -1,0 +1,19 @@
+[Unit]
+Description=fleetq fleet job queue
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=fleetq
+Group=fleetq
+Environment=PYTHONPATH=/opt/fleetq
+ExecStart=/usr/bin/python3 -m fleetq.server --config /etc/fleetq/fleet.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/fleetq
+
+[Install]
+WantedBy=multi-user.target

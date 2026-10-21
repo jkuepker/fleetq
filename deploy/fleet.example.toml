@@ -1,0 +1,129 @@
+# fleetq roster: the boxes, what normally runs on them, and how much memory it holds.
+# Copy to deploy/fleet.toml (gitignored) and describe your own fleet.
+#
+# Memory numbers are what each thing actually occupies (GiB): GPU allocation plus the
+# resident CPU-side process. Where a hardware collector is configured, fleetq cross-checks
+# them against real free memory before any job that adds memory starts.
+#
+# kind: fleet    = a role server other tools depend on; expected up
+#       standing = a long-running project the operator keeps up; expected up
+#       optional = may be on or off; its memory counts only while it answers
+
+[server]
+listen = "0.0.0.0"
+port = 8470
+token_file = "/etc/fleetq/token"
+# Optional second token that may only read: GET /v1/status, /v1/models, /v1/roster,
+# /v1/events (and /healthz, which needs none). Anything else answers 403.
+# Give this one to dashboards and status bars.
+readonly_token_file = "/etc/fleetq/readonly_token"
+db = "/var/lib/fleetq/fleetq.db"
+probe_interval_s = 30
+stale_heartbeat_s = 180
+restore_grace_s = 600
+default_expect_min = 120
+
+# ---- hosts: one per memory pool --------------------------------------------
+
+[[host]]
+name = "spark1"
+machine = "gpu-a"                     # ssh / DNS name of the box
+aliases = ["gpu-a"]
+addresses = ["192.0.2.11", "100.64.0.11"]   # every address a URL might use for this box
+capacity_gb = 116                     # unified memory, less what the OS needs
+collector = "http://gpu-a:19108"      # optional hardware collector (free memory, GPU busy)
+collector_token_file = "/etc/fleetq/collectors/spark1.token"
+collector_memory = "host"
+
+[[host]]
+name = "spark2"
+machine = "gpu-b"
+aliases = ["gpu-b"]
+addresses = ["192.0.2.12", "100.64.0.12"]
+capacity_gb = 116
+
+[[host]]
+name = "laptop"
+machine = "laptop"
+addresses = ["100.64.0.20"]
+capacity_gb = 48
+note = "sleeps and travels, so it is often offline"
+
+# A box with two discrete GPUs: one pool per card. collector_memory picks the card by PCI
+# address when both report the same name.
+
+[[host]]
+name = "workstation-gpu0"
+machine = "workstation"
+aliases = ["gpu0"]
+addresses = ["192.0.2.30"]
+default = true                        # ad-hoc URLs on this machine land on this card
+capacity_gb = 32
+collector = "http://workstation:19108"
+collector_token_file = "/etc/fleetq/collectors/workstation.token"
+collector_memory = "0000:03:00.0"
+
+[[host]]
+name = "workstation-gpu1"
+machine = "workstation"
+aliases = ["gpu1"]
+addresses = ["192.0.2.30"]
+capacity_gb = 32
+collector = "http://workstation:19108"
+collector_token_file = "/etc/fleetq/collectors/workstation.token"
+collector_memory = "0000:07:00.0"
+
+# ---- services ---------------------------------------------------------------
+
+[[service]]
+name = "spark1-vllm"
+host = "spark1"
+url = "http://gpu-a:8000/v1"
+models = ["chat"]                     # model ids the health check expects to see
+roles = ["chat", "planner"]           # what other tools call it; --uses / --takes-down accept these
+capabilities = ["text"]               # what its models can do; `fleetq models --caps` filters on these
+mem_gb = 64
+note = "vLLM, 32K context"
+
+[[service]]
+name = "spark2-vllm"
+host = "spark2"
+url = "http://gpu-b:8000/v1"
+models = ["chat"]
+roles = ["review"]
+capabilities = ["text"]
+mem_gb = 64
+
+[[service]]
+name = "laptop-embed"
+host = "laptop"
+kind = "standing"
+mem_gb = 8
+note = "loopback only, so not probed"
+
+# A tensor-parallel server spanning both cards: one entry per rank, sharing a role so
+# --takes-down big-model / --uses big-model cover both cards.
+
+[[service]]
+name = "big-model-rank0"
+host = "workstation-gpu0"
+kind = "standing"
+url = "http://workstation:8080/v1"
+roles = ["big-model"]
+mem_gb = 31
+
+[[service]]
+name = "big-model-rank1"
+host = "workstation-gpu1"
+kind = "standing"
+url = "http://workstation:8080/v1"
+roles = ["big-model"]
+mem_gb = 31
+
+[[service]]
+name = "scratch-server"
+host = "spark2"
+kind = "optional"
+probe_tcp = "gpu-b:8710"
+mem_gb = 21
+note = "optional: counts only while it answers, and nothing restores it"
