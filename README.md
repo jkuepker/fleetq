@@ -5,6 +5,8 @@ starts work on a box, it asks fleetq for a slot. If the box is busy, the job wai
 and starts when the jobs ahead of it are released. fleetq also health-checks the model
 servers on each box, so agents can ask which models are up right now and where.
 
+![fleetq status on a demo fleet: per-box memory, model servers, running and queued jobs](docs/status.png)
+
 It is one stdlib-only Python package: a small HTTP server (`fleetqd`) that holds the queue
 in SQLite, and a CLI (`fleetq`) that people, scripts and coding agents call. Examples below
 use the names of the fleet it was built for (spark1, spark2, tatooine; roles such as
