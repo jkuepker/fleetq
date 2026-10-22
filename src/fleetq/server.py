@@ -7,6 +7,7 @@ from fnmatch import fnmatchcase
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -466,8 +467,8 @@ class Fleet:
             raise ApiError(400, f'cannot both use and take down {", ".join(sorted(overlap))}')
         mem, mem_map = float(p.get('mem_gb') or 0), r['mem_map']
         need = {h: mem_map.get(h, mem) for h in hosts}
-        if any(gb < 0 for gb in need.values()):
-            raise ApiError(400, 'memory must be >= 0')
+        if not all(math.isfinite(gb) and gb >= 0 for gb in need.values()):
+            raise ApiError(400, 'memory must be a number >= 0')
         too_big = [f'{need[h]:g} GB on {h}' for h in hosts if need[h] > self.hosts[h].capacity_gb]
         if too_big:
             raise ApiError(400, f'can never fit: {", ".join(too_big)}')
@@ -724,8 +725,8 @@ class Fleet:
                 if stray:
                     raise ApiError(400, f'#{job_id} is not on {", ".join(stray)}')
                 need = {h: per_host.get(h, mem) for h in job.hosts}
-                if any(gb < 0 for gb in need.values()):
-                    raise ApiError(400, 'memory must be >= 0')
+                if not all(math.isfinite(gb) and gb >= 0 for gb in need.values()):
+                    raise ApiError(400, 'memory must be a number >= 0')
                 up = [f'{need[h]:g} GB on {h} (holds {job.mem_on(h):g})' for h in job.hosts
                       if need[h] > job.mem_on(h) + 1e-9]
                 if up:

@@ -161,7 +161,10 @@ Claims can only shrink while a job is queued or running, and take effect at once
 
 ### Go ahead of the line
 
-A job may start before jobs waiting ahead of it if it holds none of them up. A `run` job
+A job may start before jobs waiting ahead of it if it holds none of them up: it does not
+collide with them, and they still fit beside it once the jobs in their way end, even when
+nobody knows when that is (a small CPU job need not wait for a 24 GB job stuck behind a running
+40 GB job). A `run` job
 that would hold one up may still go first if it gives `--expect` and should end well before
 that job can start (`now + expect × 1.2 + 5 min`, with the start estimated from running jobs'
 `--expect`). It then has a deadline: `fleetq run` stops the command at that time (SIGTERM,
@@ -264,7 +267,7 @@ exits 0 when `FLEETQ_JOB` covers X.
 | `--caps` | what the models at `--serves` can do (`text`, `image`, `video`, `audio`, `embed`, `rerank`) |
 
 Exit codes: `run` returns the command's code; 2 = server unreachable (nothing started;
-`--no-queue` runs anyway); 3 = gave up waiting (`--wait-timeout`); 4 = the job was released
+`--no-queue` runs anyway; it does not skip the line); 3 = gave up waiting (`--wait-timeout`); 4 = the job was released
 or cancelled before it started (`fleetq release` on a queued job, or the server dropped it), so
 the command never ran. `acquire --wait` also returns 4 then.
 

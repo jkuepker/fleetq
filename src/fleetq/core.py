@@ -5,6 +5,7 @@ roster, live observations and jobs; these functions decide what may start and
 explain, in words an operator can act on, why everything else is waiting.
 """
 from __future__ import annotations
+import math
 
 from dataclasses import dataclass, field, replace
 import ipaddress
@@ -368,14 +369,39 @@ def clash(job, others, hosts, services, statuses):
 
 
 def hinders(job, waiting, others, hosts, services, statuses):
-    """Would job, running alongside others, keep waiting from starting?"""
+    """Would job, running alongside others, keep waiting from starting?
+
+    others: what may still run when waiting is due. Waiting starts once enough of them have
+    ended, and which ones end first is often unknown (no --expect), so job hinders it if it
+    would not fit in the room left in the tightest case: the fullest set of others that
+    waiting can start alongside. Taking only "all of others" would make every job with
+    memory hinder a waiting job that is short of memory now, though it fits beside job once
+    the job in its way ends. If waiting cannot fit even with all others gone, job hinders it.
+    """
     if collision(waiting, job):
         return True
     for h in waiting.hosts:
         gb = job.mem_on(h) if h in job.hosts else 0
-        if gb > 1e-9 and gb > room(waiting, others, hosts[h], services, statuses) + 1e-9:
+        if gb > 1e-9 and gb > _tightest_room(waiting, others, hosts[h], services, statuses) + 1e-9:
             return True
     return False
+
+
+def _tightest_room(waiting, others, host, services, statuses):
+    """Least GB left on host when waiting starts alongside any set of others it can run with
+    (negative: it does not fit even with all of them gone)."""
+    stay = [o for o in others if host.name in o.hosts and not collision(waiting, o)]
+    base = room(waiting, [], host, services, statuses)
+    if base < -1e-9:
+        return base
+    mems = [o.mem_on(host.name) for o in stay]
+    if not all(math.isfinite(m) for m in mems + [base]) or len(stay) > 16:
+        return room(waiting, stay, host, services, statuses)   # the old, all-of-them rule
+    # Largest true total of others that still leaves room for waiting (exact subset sums).
+    sums = {0.0}
+    for m in mems:
+        sums |= {s + m for s in sums if s + m <= base + 1e-9}
+    return base - max(sums)
 
 
 def blocker(job, hosts, services, statuses, obs, running, host_online, actual_free,
@@ -488,7 +514,14 @@ def _ahead_ok(job, protected, booked_ids, running, ends, starts, now, default_ex
         else:
             shared = [h for h in job.hosts if h in w.hosts] or w.hosts
             why = f'in line behind {w.brief()} on {", ".join(shared)}'
-        if job.kind == 'run' and job.expect_source != GIVEN:
+        if job.kind != 'run':
+            pass
+        elif at is None:
+            unknown = [o for o in running if ends[o.id] is None and set(o.hosts) & set(w.hosts)]
+            why += (f'; #{w.id} has no estimated start'
+                    + (f' ({", ".join("#" + str(o.id) for o in unknown)} gave no --expect)' if unknown else '')
+                    + ', so nothing can go first by ending before it')
+        elif job.expect_source != GIVEN:
             why += f'; with --expect it may go first if it ends before {"that" if booked else "#" + str(w.id)} starts'
         return why, None
     return None, deadline

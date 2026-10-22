@@ -1257,7 +1257,7 @@ def parser():
                         'at that job\'s start). Without it the server estimates from similar finished runs, '
                         'which never sets a deadline; "auto" takes that estimate as your own (needs 5 similar runs)')
     add_start_args(p)
-    p.add_argument('--no-queue', action='store_true', help='if the server is unreachable, run anyway')
+    p.add_argument('--no-queue', action='store_true', help='only if the server is unreachable: run without a slot (does not skip the line)')
     p.add_argument('--each', action='store_true',
                    help='run the command once per host, all at once, filling {host} {machine} {rank} {nhosts}')
     p.add_argument('--keep-going', action='store_true', help='with --each: do not stop the others when one fails')

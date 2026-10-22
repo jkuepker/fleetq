@@ -441,3 +441,15 @@ def test_second_ctrl_c_while_draining_kills_the_leftovers_and_returns(tmp_path):
     finally:
         for pid in running(marker):
             os.kill(int(pid), signal.SIGKILL)
+
+
+def test_memory_must_be_a_finite_number(env):
+    fleet, clock, url = env
+    for bad in ({'mem_gb': float('nan')}, {'mem_gb': float('inf')}, {'mem_map': {'a': float('nan')}}):
+        code, body = api(url, 'POST', '/v1/jobs', {'label': 'x', 'owner': 'me', 'hosts': ['a'], **bad})
+        assert code == 400 and 'memory must be a number >= 0' in body['error'], bad
+    job = submit(fleet, mem_gb=10)
+    for bad in ({'mem_gb': float('nan')}, {'mem_map': {'a': float('nan')}}):
+        code, body = api(url, 'POST', f'/v1/jobs/{job["id"]}/update', {'owner': 'me', **bad})
+        assert code == 400 and 'memory must be a number >= 0' in body['error'], bad
+    assert fleet.store.job(job['id']).mem_gb == 10

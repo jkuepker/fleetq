@@ -251,8 +251,9 @@ fleetq cannot see, as an exclusive job does: requests in flight that no job acco
 wedged service, a GPU the collector reports busy.
 
 **Backfill.** Each host keeps a first-come line. A job behind a waiting job may start now if
-it does not hold that job up (no collision with it, memory left for it once the jobs expected
-to be gone by then are gone), or, for a `run` job with `expect_min`, if
+it does not hold that job up (no collision with it, and memory left for it once the jobs
+expected to be gone by then are gone; when that is unknown, memory left for it whichever of
+the running jobs end first, as long as enough end for it to fit), or, for a `run` job with `expect_min`, if
 `now + expect * 1.2 + 5 min` is before that job's estimated start. The estimate comes from
 running jobs' `started_at + expect_s`; when one in the way has no `expect_s`, or something
 other than a job holds it up, there is none and only the first rule applies. A run job let

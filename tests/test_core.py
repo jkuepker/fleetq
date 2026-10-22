@@ -40,15 +40,16 @@ class World:
 
 def test_waits_until_enough_memory_frees_then_later_jobs_follow_in_order():
     w = World()  # 100 GB host, 40 held by a-llm: 60 free for jobs
-    a, b = job(1, RUNNING, mem_gb=25), job(2, RUNNING, mem_gb=25)
+    a, b = job(1, RUNNING, mem_gb=20), job(2, RUNNING, mem_gb=28)
     c, d = job(3, mem_gb=30), job(4, mem_gb=5)
     start, why = w.plan([a, b, c, d])
     assert start == []
-    assert why[3] == 'needs 30 GB on a; 10 GB free of 100'
-    assert why[4].startswith('in line behind #3')  # small job does not jump the big one
-    a.state = core.DONE
+    assert why[3] == 'needs 30 GB on a; 12 GB free of 100'
+    # Small job does not jump the big one: if only #1 ends, #3 has 2 GB to spare, not 5.
+    assert why[4].startswith('in line behind #3')
+    b.state = core.DONE
     start, why = w.plan([a, b, c, d])
-    assert start == [3, 4]  # 35 free: c takes 30, d fits in the remaining 5
+    assert start == [3, 4]  # 40 free: c takes 30, d fits in the remaining 10
 
 
 def test_bigger_job_keeps_waiting_when_one_finisher_is_not_enough():
@@ -439,6 +440,76 @@ def test_backfill_respects_memory_the_head_will_need():
     p = core.plan([running, head, fits, hogs], w.hosts, w.services, w.statuses([running]), w.obs,
                   w.online, {}, now=NOW)
     assert p.to_start == [3] and p.reasons[4].startswith('in line behind #2')
+
+
+def test_head_short_of_memory_behind_a_job_without_expect_lets_small_jobs_through():
+    # gpu-b: 110 GB, 50 held by services, #1 runs 40 GB with no --expect, and the
+    # head needs 24 GB of the 20 free. Its start is unknown, but once #1 ends it has 60 GB,
+    # so small jobs that fit now do not hold it up, --expect or not.
+    w = World(cap=110, svc_mem=50)
+    running = job(1, RUNNING, kind='run', mem_gb=40, started_at=NOW - 2400)
+    head = job(2, kind='run', mem_gb=24)
+    build = job(3, kind='run', mem_gb=6, expect_s=1500)
+    cpu10 = job(4, kind='run', mem_gb=4, load=['cpu'], expect_s=600)
+    cpu = job(5, kind='run', mem_gb=4, load=['cpu'])
+    cpu60 = job(6, kind='run', mem_gb=4, load=['cpu'], expect_s=3600)
+    excl = job(7, kind='run', exclusive=True)
+    big = job(8, kind='run', mem_gb=30, expect_s=1800)
+    tiny = job(9, kind='run', load=['cpu'], expect_s=1500)
+    jobs = [running, head, build, cpu10, cpu, cpu60, excl, big, tiny]
+    p = core.plan(jobs, w.hosts, w.services, w.statuses([running]), w.obs, w.online, {}, now=NOW)
+    assert p.to_start == [3, 4, 5, 6] and p.deadlines == {}
+    assert p.starts[2] is None and p.line == [2, 7, 8, 9]
+    assert p.reasons[7].startswith('in line behind #2')  # exclusive: holds #2 up
+    assert p.reasons[8].startswith('in line behind #2')  # 30 GB does not fit now
+    assert p.reasons[9].startswith('in line behind #7')  # #7 needs the host to itself
+
+
+def test_small_jobs_stop_once_the_head_would_not_fit_when_its_blocker_ends():
+    w = World(cap=110, svc_mem=50)  # 60 GB for jobs
+    running = job(1, RUNNING, kind='run', mem_gb=40, started_at=NOW - 60)
+    head = job(2, kind='run', mem_gb=50)  # 10 GB to spare once #1 ends
+    small = [job(i, kind='run', mem_gb=4, load=['cpu'], expect_s=600) for i in (3, 4, 5)]
+    p = core.plan([running, head] + small, w.hosts, w.services, w.statuses([running]), w.obs, w.online, {},
+                  now=NOW)
+    assert p.to_start == [3, 4]  # 8 GB of the 10; a third would leave #2 short
+    assert p.reasons[5] == ('in line behind #2 "j2" (o) on a; #2 has no estimated start (#1 gave no --expect), '
+                            'so nothing can go first by ending before it')
+    # Several running jobs, ends unknown: the head is protected whichever one ends first.
+    a, b = job(1, RUNNING, mem_gb=20, started_at=NOW), job(2, RUNNING, mem_gb=28, started_at=NOW)
+    head = job(3, mem_gb=30)  # 2 GB to spare if only #1 ends, 10 if only #2 ends
+    p = core.plan([a, b, head, job(4, mem_gb=2), job(5, mem_gb=1)], w.hosts, w.services, w.statuses([a, b]),
+                  w.obs, w.online, {}, now=NOW)
+    assert p.to_start == [4] and p.reasons[5].startswith('in line behind #3')
+
+
+def test_room_left_for_a_head_is_summed_exactly():
+    # 0.1 GB rounding once made two 10.75 GB jobs look like 21.6 of the 21.5 the head leaves,
+    # so a 5 GB job looked harmless and a stream of them starved the head.
+    w = World()  # 60 GB for jobs
+    blocker = job(1, RUNNING, started_at=NOW)                       # loads gpu, no --expect
+    stay = [job(i, RUNNING, mem_gb=10.75, load=['cpu'], started_at=NOW) for i in (2, 3)]
+    head = job(4, mem_gb=38.5, quiet=['gpu'], load=['cpu'])         # 21.5 + 38.5 = 60
+    small = job(5, kind='run', mem_gb=5, load=['cpu'], expect_s=600)
+    running = [blocker] + stay
+    p = core.plan(running + [head, small], w.hosts, w.services, w.statuses(running), w.obs, w.online, {},
+                  now=NOW)
+    assert p.to_start == [] and p.reasons[5].startswith('in line behind #4')
+    # A job that fits exactly beside the head still goes.
+    exact = job(6, mem_gb=21.5, load=['cpu'])
+    p = core.plan([blocker, head, exact], w.hosts, w.services, w.statuses([blocker]), w.obs, w.online, {},
+                  now=NOW)
+    assert p.to_start == [6]
+
+
+def test_memory_that_is_not_a_number_does_not_break_the_plan():
+    w = World()
+    blocker = job(1, RUNNING, started_at=NOW)
+    odd = job(2, RUNNING, mem_map={'a': float('nan')}, load=['cpu'], started_at=NOW)
+    head = job(3, mem_gb=10, quiet=['gpu'], load=['cpu'])
+    p = core.plan([blocker, odd, head, job(4, mem_gb=4, load=['cpu'])], w.hosts, w.services,
+                  w.statuses([blocker, odd]), w.obs, w.online, {}, now=NOW)
+    assert 3 in p.reasons
 
 
 def test_reservation_waits_for_its_time_then_goes_first_in_line():
