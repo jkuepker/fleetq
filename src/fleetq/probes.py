@@ -16,15 +16,15 @@ from .core import Observation
 
 GIB = 1024 ** 3
 METRIC_RE = re.compile(r'^([a-zA-Z_:][\w:]*)(\{[^}]*\})?\s+([-+0-9.eE]+|NaN)$')
-# Prometheus gauges that count requests a server is working on or holding (vLLM, llama.cpp; native radiance exports the vllm: names).
+# Prometheus gauges that count requests a server is working on or holding (vLLM, llama.cpp; a native engine exports the vllm: names).
 BUSY_GAUGES = ('vllm:num_requests_running', 'vllm:num_requests_waiting',
                'llamacpp:requests_processing', 'llamacpp:requests_deferred')
 # Counters that move on every engine step (vLLM: one histogram sample per scheduler iteration,
-# prefill chunks included; llama.cpp: llama_decode() calls; native radiance: scheduler steps).
+# prefill chunks included; llama.cpp: llama_decode() calls; a native engine: scheduler steps).
 # A wedged engine stops them all. A server exposes one family; if two ever appeared together
 # engine_load would sum them, which still moves whenever either does.
 PROGRESS_COUNTERS = ('vllm:iteration_tokens_total_count', 'llamacpp:n_decode_total',
-                     'radiance:engine_steps_total')
+                     'native:engine_steps_total')
 
 
 def http_get(url, headers=None, timeout=5.0):
@@ -57,7 +57,7 @@ def engine_load(base_url):
     root = base_url.rstrip('/')
     if root.endswith('/v1'):
         root = root[:-3]
-    flight = progress = None
+    active = progress = None
     code, body = http_get(root + '/metrics', timeout=3.0)
     if code == 200:
         for line in body.decode(errors='replace').splitlines():
@@ -65,11 +65,11 @@ def engine_load(base_url):
             if not m or m.group(3) == 'NaN':
                 continue
             if m.group(1) in BUSY_GAUGES:
-                flight = (flight or 0.0) + float(m.group(3))
+                active = (active or 0.0) + float(m.group(3))
             elif m.group(1) in PROGRESS_COUNTERS:
                 progress = (progress or 0.0) + float(m.group(3))
-        if flight is not None:
-            return int(flight), progress
+        if active is not None:
+            return int(active), progress
     code, body = http_get(root + '/slots', timeout=3.0)
     if code == 200:
         try:
@@ -92,16 +92,16 @@ def probe_service(svc, now):
                 return Observation('wrong', detail='answers /models with an unreadable body', at=now)
             served = [m['id'] for m in listing]
             missing = [m for m in svc.models if m not in served]
-            flight, progress = engine_load(svc.url)
-            obs = Observation('up' if not missing else 'wrong', served, flight, at=now, progress=progress,
+            active, progress = engine_load(svc.url)
+            obs = Observation('up' if not missing else 'wrong', served, active, at=now, progress=progress,
                               served=listing)
             if missing:
                 obs.detail = f'serving {", ".join(served) or "nothing"}; expected {", ".join(missing)}'
             return obs
         if code in (401, 403):
-            flight, progress = engine_load(svc.url)
+            active, progress = engine_load(svc.url)
             return Observation('unverified', detail=f'HTTP {code} on /models',
-                               in_flight=flight, at=now, progress=progress)
+                               in_flight=active, at=now, progress=progress)
         detail = f'HTTP {code} on /models' if code else f'unreachable ({body.decode(errors="replace")[:80]})'
         return Observation('down', detail=detail, at=now)
     if svc.probe_tcp:

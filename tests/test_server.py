@@ -34,7 +34,7 @@ name = "a-llm"
 host = "a"
 url = "http://ma:8000/v1"
 models = ["m"]
-roles = ["flight"]
+roles = ["chat-a"]
 mem_gb = 40
 """
 
@@ -171,9 +171,9 @@ def test_bad_requests_are_explained(env):
 
 def test_takedown_then_restore_seen_by_health_check(env):
     fleet, clock, url = env
-    _, job = api(url, 'POST', '/v1/jobs', {'label': 'swap model', 'owner': 'o', 'takes_down': ['flight']})
-    assert job['state'] == 'running' and job['hosts'] == ['a'] and job['roles_taken_down'] == ['flight']
-    _, user = api(url, 'POST', '/v1/jobs', {'label': 'mission', 'owner': 'o', 'uses': ['flight']})
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'swap model', 'owner': 'o', 'takes_down': ['chat-a']})
+    assert job['state'] == 'running' and job['hosts'] == ['a'] and job['roles_taken_down'] == ['chat-a']
+    _, user = api(url, 'POST', '/v1/jobs', {'label': 'mission', 'owner': 'o', 'uses': ['chat-a']})
     assert user['state'] == 'queued' and 'taken down by' in user['reason']
     clock.t += 60
     api(url, 'POST', f'/v1/jobs/{job["id"]}/release', {'owner': 'o'})
@@ -270,7 +270,7 @@ def test_wedged_server_is_detected_across_probes_and_its_restart_skips_the_line(
     assert any('WEDGED' in w for w in status['warnings'])
     assert not any('untracked requests in flight' in w for w in status['warnings'])
     assert 'a-llm is wedged' in api(url, 'GET', f'/v1/jobs/{bench["id"]}')[1]['reason']
-    _, restart = api(url, 'POST', '/v1/jobs', {'label': 'restart', 'owner': 'o', 'takes_down': ['flight']})
+    _, restart = api(url, 'POST', '/v1/jobs', {'label': 'restart', 'owner': 'o', 'takes_down': ['chat-a']})
     assert restart['state'] == 'running'  # ahead of #bench, which waits for a quiet a-llm
     clock.t += 60
     api(url, 'POST', f'/v1/jobs/{restart["id"]}/release', {'owner': 'o'})
@@ -337,7 +337,7 @@ def test_uses_url_takes_a_shared_lease_on_the_service_behind_it(env):
     _, job = api(url, 'POST', '/v1/jobs', {'label': 'mission', 'owner': 'mc', 'kind': 'run',
                                           'uses_url': 'http://ma:8000/v1'})
     assert job['state'] == 'running' and job['hosts'] == ['a'] and job['uses'] == ['a-llm']
-    _, takedown = api(url, 'POST', '/v1/jobs', {'label': 'swap', 'owner': 'o', 'takes_down': ['flight']})
+    _, takedown = api(url, 'POST', '/v1/jobs', {'label': 'swap', 'owner': 'o', 'takes_down': ['chat-a']})
     assert takedown['state'] == 'queued' and 'in use by #' in takedown['reason']
     code, body = api(url, 'POST', '/v1/jobs', {'label': 'x', 'owner': 'mc', 'uses_url': 'http://example.com/v1'})
     assert code == 422 and body['not_fleet']
@@ -392,13 +392,13 @@ def test_existing_database_gains_the_per_host_memory_column(tmp_path):
     old.close()
     store = Store(path)
     assert store.job(1).mem_map == {} and store.job(1).mem_on('a') == 0
-    assert store.job(1).serves == [] and store.job(1).serves_caps == []
     assert store.job(1).watch is False and store.job(1).seen_at is None
+    assert store.job(1).serves == [] and store.job(1).serves_caps == []
 
 
 def test_mem_option_takes_a_default_and_per_host_values():
     assert cli.parse_mem(['30']) == (30.0, {})
-    assert cli.parse_mem(['spark1=100,spark2=90']) == (0.0, {'spark1': 100.0, 'spark2': 90.0})
+    assert cli.parse_mem(['gpu-a=100,gpu-b=90']) == (0.0, {'gpu-a': 100.0, 'gpu-b': 90.0})
     assert cli.parse_mem(['20', 'a=5']) == (20.0, {'a': 5.0})
     assert cli.parse_mem(None) == (0.0, {})
     with pytest.raises(SystemExit):
@@ -489,7 +489,7 @@ def test_run_rechecks_its_slot_right_before_starting(env, tmp_path, monkeypatch)
     marker = tmp_path / 'ran'
     real = cli.wait_until_running
 
-    def released_after_last_poll(client, job, timeout_s, heartbeat):
+    def released_after_last_poll(client, job, timeout_s, heartbeat, owner=None):
         got = real(client, job, timeout_s, heartbeat)
         api(url, 'POST', f'/v1/jobs/{job["id"]}/release', {'owner': 'tester'})  # lands between poll and exec
         return got
@@ -504,11 +504,115 @@ def test_acquire_wait_reports_a_cancelled_lease(env, monkeypatch):
     api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'other', 'hosts': ['a'], 'exclusive': True})
     real = cli.wait_until_running
 
-    def release_then_wait(client, job, timeout_s, heartbeat):
+    def release_then_wait(client, job, timeout_s, heartbeat, owner=None):
         api(url, 'POST', f'/v1/jobs/{job["id"]}/release', {'owner': 'tester'})
         return real(client, job, timeout_s, heartbeat)
     monkeypatch.setattr(cli, 'wait_until_running', release_then_wait)
     assert cli.main(['acquire', '--host', 'a', '--label', 'lease', '--wait']) == cli.EXIT_CANCELLED
+
+
+def hold_a(url):
+    """An exclusive lease on host a held by someone else, so the next job on a waits."""
+    return api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'other', 'hosts': ['a'], 'exclusive': True})[1]
+
+
+def test_queued_lease_whose_waiter_vanished_is_dropped_but_an_unwatched_one_stays(env):
+    fleet, clock, url = env
+    hold_a(url)
+    _, watched = api(url, 'POST', '/v1/jobs', {'label': 'waiter', 'owner': 'o', 'hosts': ['a'], 'watch': True})
+    _, plain = api(url, 'POST', '/v1/jobs', {'label': 'plain', 'owner': 'o', 'hosts': ['a']})
+    assert watched['watch'] and watched['heartbeat_at'] == clock.t and not plain['watch']
+    clock.t += 200  # past stale_heartbeat_s
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert fleet.get(watched['id'])['state'] == 'cancelled'
+    assert fleet.get(plain['id'])['state'] == 'queued'
+    events = api(url, 'GET', '/v1/events')[1]['events']
+    assert any(e['kind'] == 'abandoned' and e['job_id'] == watched['id'] for e in events)
+
+
+def test_acquire_wait_heartbeats_while_queued(env, monkeypatch):
+    fleet, clock, url = env
+    hold = hold_a(url)
+    monkeypatch.setattr(cli, 'HEARTBEAT_S', 0)
+    result = {}
+    t = threading.Thread(target=lambda: result.update(code=cli.main(
+        ['acquire', '--host', 'a', '--label', 'lease', '--wait'])))
+    t.start()
+    t.join(0.3)
+    lease = api(url, 'GET', '/v1/status')[1]['hosts'][0]['queued'][0]
+    assert lease['watch']
+    clock.t += 150
+    t.join(0.3)
+    assert fleet.get(lease['id'])['heartbeat_at'] == clock.t
+    clock.t += 150  # 300 s after submit: dropped without the heartbeats
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert fleet.get(lease['id'])['state'] == 'queued'
+    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'other'})
+    t.join(5)
+    assert result['code'] == 0
+    assert fleet.get(lease['id'])['state'] == 'running' and not fleet.get(lease['id'])['flags']
+
+
+@pytest.mark.parametrize('stop', ['ctrl-c', 'timeout'])
+def test_acquire_wait_stopped_on_purpose_keeps_its_place(env, monkeypatch, stop):
+    fleet, clock, url = env
+    hold_a(url)
+
+    def stop_waiting(client, job, timeout_s, heartbeat, owner=None):
+        assert heartbeat and fleet.get(job['id'])['watch']
+        if stop == 'ctrl-c':
+            raise KeyboardInterrupt
+        return None
+    monkeypatch.setattr(cli, 'wait_until_running', stop_waiting)
+    code = cli.main(['acquire', '--host', 'a', '--label', 'lease', '--wait', '--wait-timeout', '1'])
+    assert code == (130 if stop == 'ctrl-c' else cli.EXIT_TIMEOUT)
+    lease = api(url, 'GET', '/v1/status')[1]['hosts'][0]['queued'][0]
+    assert not lease['watch']
+    clock.t += 200
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert fleet.get(lease['id'])['state'] == 'queued'
+
+
+def test_lease_that_starts_with_nobody_checking_is_flagged_unclaimed_not_released(env, capsys):
+    fleet, clock, url = env
+    hold = hold_a(url)
+    _, lease = api(url, 'POST', '/v1/jobs', {'label': 'forgotten', 'owner': 'o', 'hosts': ['a']})
+    clock.t += 700  # nobody looks at it while it waits
+    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'other'})
+    fleet.apply_probe({}, {}, {}, clock.t)
+    status = api(url, 'GET', '/v1/status')[1]
+    running = status['hosts'][0]['running'][0]
+    assert running['id'] == lease['id'] and running['state'] == 'running'
+    assert any(f.startswith('unclaimed:') for f in running['flags'])
+    assert any('unclaimed:' in w and 'forgotten' in w for w in status['warnings'])
+    events = api(url, 'GET', '/v1/events')[1]['events']
+    assert [e['kind'] for e in events if e['job_id'] == lease['id']].count('unclaimed') == 1
+    capsys.readouterr()
+    assert cli.main(['status']) == 0
+    assert 'unclaimed' in capsys.readouterr().out
+    # Any client looking at it (fleetq show, FLEETQ_JOB inside it) claims it.
+    assert api(url, 'GET', f'/v1/jobs/{lease["id"]}')[1]['flags'] == []
+
+
+def test_lease_whose_waiter_died_just_before_it_started_is_flagged_once_the_window_passes(env):
+    fleet, clock, url = env
+    hold = hold_a(url)
+    _, lease = api(url, 'POST', '/v1/jobs', {'label': 'late', 'owner': 'o', 'hosts': ['a'], 'watch': True})
+    clock.t += 60  # the waiter dies before its lease is stale enough to drop
+    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'other'})
+    assert fleet.get(lease['id'])['state'] == 'running' and fleet.get(lease['id'])['flags'] == []
+    clock.t += 600
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert any('unclaimed:' in w for w in api(url, 'GET', '/v1/status')[1]['warnings'])
+
+
+def test_lease_started_right_away_is_never_unclaimed(env):
+    fleet, clock, url = env
+    _, lease = api(url, 'POST', '/v1/jobs', {'label': 'long work', 'owner': 'o', 'hosts': ['b'], 'expect_min': 600})
+    assert lease['state'] == 'running'
+    clock.t += 5 * 3600
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert api(url, 'GET', '/v1/status')[1]['warnings'] == []
 
 
 def test_models_endpoint_and_cli_filter_by_capability(env, capsys):
@@ -522,7 +626,7 @@ def test_models_endpoint_and_cli_filter_by_capability(env, capsys):
     assert code == 400 and 'unknown capability vison' in body['error']
     assert cli.main(['models', '--cap', 'image']) == 0
     out = capsys.readouterr().out
-    assert out.startswith('+  m  text,image') and 'http://ma:8000/v1' in out and 'flight' in out
+    assert out.startswith('+  m  text,image') and 'http://ma:8000/v1' in out and 'chat-a' in out
     st = api(url, 'GET', '/v1/status')[1]['hosts'][0]['services'][0]
     assert st['url'] == 'http://ma:8000/v1' and st['served'] == [{'id': 'm'}]
 
@@ -721,8 +825,8 @@ def test_fast_probe_checks_only_what_a_job_waits_to_see_come_up(env, monkeypatch
         return {s.name: Observation('up', ['m'], 0, at=now) for s in services}, {}, {}
     monkeypatch.setattr(probes, 'probe_all', probe_all)
     assert fleet.probe_fast() is False and probed == []
-    _, swap = api(url, 'POST', '/v1/jobs', {'label': 'swap', 'owner': 'o', 'takes_down': ['flight']})
-    _, user = api(url, 'POST', '/v1/jobs', {'label': 'mission', 'owner': 'o', 'uses': ['flight']})
+    _, swap = api(url, 'POST', '/v1/jobs', {'label': 'swap', 'owner': 'o', 'takes_down': ['chat-a']})
+    _, user = api(url, 'POST', '/v1/jobs', {'label': 'mission', 'owner': 'o', 'uses': ['chat-a']})
     clock.t += 60
     api(url, 'POST', f'/v1/jobs/{swap["id"]}/release', {'owner': 'o'})
     before = fleet.last_probe
@@ -752,107 +856,3 @@ def test_probe_loop_runs_fast_checks_between_full_ones(env, monkeypatch):
     stop.set()
     t.join(2)
     assert calls.count('full') >= 2 and calls.count('fast') >= 3
-
-
-def hold_a(url):
-    """An exclusive lease on host a held by someone else, so the next job on a waits."""
-    return api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'other', 'hosts': ['a'], 'exclusive': True})[1]
-
-
-def test_queued_lease_whose_waiter_vanished_is_dropped_but_an_unwatched_one_stays(env):
-    fleet, clock, url = env
-    hold_a(url)
-    _, watched = api(url, 'POST', '/v1/jobs', {'label': 'waiter', 'owner': 'o', 'hosts': ['a'], 'watch': True})
-    _, plain = api(url, 'POST', '/v1/jobs', {'label': 'plain', 'owner': 'o', 'hosts': ['a']})
-    assert watched['watch'] and watched['heartbeat_at'] == clock.t and not plain['watch']
-    clock.t += 200  # past stale_heartbeat_s
-    fleet.apply_probe({}, {}, {}, clock.t)
-    assert fleet.get(watched['id'])['state'] == 'cancelled'
-    assert fleet.get(plain['id'])['state'] == 'queued'
-    events = api(url, 'GET', '/v1/events')[1]['events']
-    assert any(e['kind'] == 'abandoned' and e['job_id'] == watched['id'] for e in events)
-
-
-def test_acquire_wait_heartbeats_while_queued(env, monkeypatch):
-    fleet, clock, url = env
-    hold = hold_a(url)
-    monkeypatch.setattr(cli, 'HEARTBEAT_S', 0)
-    result = {}
-    t = threading.Thread(target=lambda: result.update(code=cli.main(
-        ['acquire', '--host', 'a', '--label', 'lease', '--wait'])))
-    t.start()
-    t.join(0.3)
-    lease = api(url, 'GET', '/v1/status')[1]['hosts'][0]['queued'][0]
-    assert lease['watch']
-    clock.t += 150
-    t.join(0.3)
-    assert fleet.get(lease['id'])['heartbeat_at'] == clock.t
-    clock.t += 150  # 300 s after submit: dropped without the heartbeats
-    fleet.apply_probe({}, {}, {}, clock.t)
-    assert fleet.get(lease['id'])['state'] == 'queued'
-    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'other'})
-    t.join(5)
-    assert result['code'] == 0
-    assert fleet.get(lease['id'])['state'] == 'running' and not fleet.get(lease['id'])['flags']
-
-
-@pytest.mark.parametrize('stop', ['ctrl-c', 'timeout'])
-def test_acquire_wait_stopped_on_purpose_keeps_its_place(env, monkeypatch, stop):
-    fleet, clock, url = env
-    hold_a(url)
-
-    def stop_waiting(client, job, timeout_s, heartbeat):
-        assert heartbeat and fleet.get(job['id'])['watch']
-        if stop == 'ctrl-c':
-            raise KeyboardInterrupt
-        return None
-    monkeypatch.setattr(cli, 'wait_until_running', stop_waiting)
-    code = cli.main(['acquire', '--host', 'a', '--label', 'lease', '--wait', '--wait-timeout', '1'])
-    assert code == (130 if stop == 'ctrl-c' else cli.EXIT_TIMEOUT)
-    lease = api(url, 'GET', '/v1/status')[1]['hosts'][0]['queued'][0]
-    assert not lease['watch']
-    clock.t += 200
-    fleet.apply_probe({}, {}, {}, clock.t)
-    assert fleet.get(lease['id'])['state'] == 'queued'
-
-
-def test_lease_that_starts_with_nobody_checking_is_flagged_unclaimed_not_released(env, capsys):
-    fleet, clock, url = env
-    hold = hold_a(url)
-    _, lease = api(url, 'POST', '/v1/jobs', {'label': 'forgotten', 'owner': 'o', 'hosts': ['a']})
-    clock.t += 700  # nobody looks at it while it waits
-    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'other'})
-    fleet.apply_probe({}, {}, {}, clock.t)
-    status = api(url, 'GET', '/v1/status')[1]
-    running = status['hosts'][0]['running'][0]
-    assert running['id'] == lease['id'] and running['state'] == 'running'
-    assert any(f.startswith('unclaimed:') for f in running['flags'])
-    assert any('unclaimed:' in w and 'forgotten' in w for w in status['warnings'])
-    events = api(url, 'GET', '/v1/events')[1]['events']
-    assert [e['kind'] for e in events if e['job_id'] == lease['id']].count('unclaimed') == 1
-    capsys.readouterr()
-    assert cli.main(['status']) == 0
-    assert 'unclaimed' in capsys.readouterr().out
-    # Any client looking at it (fleetq show, FLEETQ_JOB inside it) claims it.
-    assert api(url, 'GET', f'/v1/jobs/{lease["id"]}')[1]['flags'] == []
-
-
-def test_lease_whose_waiter_died_just_before_it_started_is_flagged_once_the_window_passes(env):
-    fleet, clock, url = env
-    hold = hold_a(url)
-    _, lease = api(url, 'POST', '/v1/jobs', {'label': 'late', 'owner': 'o', 'hosts': ['a'], 'watch': True})
-    clock.t += 60  # the waiter dies before its lease is stale enough to drop
-    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'other'})
-    assert fleet.get(lease['id'])['state'] == 'running' and fleet.get(lease['id'])['flags'] == []
-    clock.t += 600
-    fleet.apply_probe({}, {}, {}, clock.t)
-    assert any('unclaimed:' in w for w in api(url, 'GET', '/v1/status')[1]['warnings'])
-
-
-def test_lease_started_right_away_is_never_unclaimed(env):
-    fleet, clock, url = env
-    _, lease = api(url, 'POST', '/v1/jobs', {'label': 'long work', 'owner': 'o', 'hosts': ['b'], 'expect_min': 600})
-    assert lease['state'] == 'running'
-    clock.t += 5 * 3600
-    fleet.apply_probe({}, {}, {}, clock.t)
-    assert api(url, 'GET', '/v1/status')[1]['warnings'] == []
