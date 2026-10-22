@@ -580,3 +580,16 @@ def test_a_job_in_line_behind_an_exclusive_holder_names_the_holder_first():
     start, why = w.plan([holder, job(2), job(3)])
     assert start == [] and why[2] == 'a is held exclusively by #1 "j1" (o)'
     assert why[3] == 'a is held exclusively by #1 "j1" (o); then in line behind #2 "j2" (o) on a'
+
+
+def test_a_blocked_exclusive_job_names_the_quiet_that_would_start_it_now():
+    w = World()
+    cpu = job(1, RUNNING, load=['cpu'], started_at=NOW, expect_s=3600)
+    start, why = w.plan([cpu, job(2, exclusive=True)])
+    assert start == [] and why[2].endswith('--quiet gpu instead of --exclusive would start it now')
+    net = job(1, RUNNING, load=['net'], started_at=NOW, expect_s=3600)
+    start, why = w.plan([net, job(2, exclusive=True)])
+    assert why[2].endswith('--quiet gpu,cpu instead of --exclusive would start it now')
+    gpu = job(1, RUNNING, started_at=NOW, expect_s=3600)                 # loads the GPU: no quiet helps
+    start, why = w.plan([gpu, job(2, exclusive=True)])
+    assert '--quiet' not in why[2]

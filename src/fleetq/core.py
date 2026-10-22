@@ -482,6 +482,17 @@ class Plan:
     line: list = field(default_factory=list)       # waiting job ids, first in line first
 
 
+def _share_hint(job, hosts, services, statuses, obs, running, host_online, free, actual_util):
+    """For an exclusive job that cannot start: name the --quiet that would let it start now, if
+    one would. Most exclusive jobs only need the box quiet, and sharing it is the larger saving."""
+    for words in (['gpu', 'cpu'], ['gpu']):
+        if blocker(replace(job, exclusive=False, quiet=words), hosts, services, statuses, obs,
+                   running, host_online, free, actual_util) is None:
+            q = ','.join(words)
+            return f'; if it only needs {q} quiet, --quiet {q} instead of --exclusive would start it now'
+    return ''
+
+
 def _sure_end(job, ends, now, default_expect_s):
     """When a running job is surely off its box, for deciding whether it is still there when a
     waiting job or reservation starts. A learned estimate has no deadline behind it, so it is
@@ -580,6 +591,8 @@ def plan(jobs, hosts, services, statuses, obs, host_online, actual_free, actual_
             protected = ahead + [r for r in booked if set(r.hosts) & set(job.hosts) or collision(job, r)]
             why, deadline = _ahead_ok(job, protected, booked_ids, running, ends, p.starts, now,
                                       default_expect_s, hosts, services, statuses)
+        elif job.exclusive and not job.takes_down and not ahead:
+            why += _share_hint(job, hosts, services, statuses, obs, running, host_online, free, actual_util)
         elif ahead:
             lines = [h for h in job.hosts if h in ahead[0].hosts and h not in clears]
             why = f'in line behind {ahead[0].brief()} on {", ".join(lines)}'
