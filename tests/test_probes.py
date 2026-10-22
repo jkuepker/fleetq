@@ -42,32 +42,32 @@ def fake():
 
 
 def test_model_server_up_with_in_flight_count(fake):
-    url = fake({'/v1/models': (200, {'data': [{'id': 'guidance'}, {'id': 'capcom'}]}),
-                '/metrics': (200, 'vllm:num_requests_running{model_name="guidance"} 2.0\n'
-                                  'vllm:num_requests_waiting{model_name="guidance"} 1.0\n')})
-    obs = probes.probe_service(Service('s', 'h', url=url + '/v1', models=['guidance']), 5.0)
+    url = fake({'/v1/models': (200, {'data': [{'id': 'reason-a'}, {'id': 'vision-a'}]}),
+                '/metrics': (200, 'vllm:num_requests_running{model_name="reason-a"} 2.0\n'
+                                  'vllm:num_requests_waiting{model_name="reason-a"} 1.0\n')})
+    obs = probes.probe_service(Service('s', 'h', url=url + '/v1', models=['reason-a']), 5.0)
     assert (obs.state, obs.in_flight, obs.at) == ('up', 3, 5.0)
 
 
 def test_model_listing_keeps_root_and_context_length(fake):
     url = fake({'/v1/models': (200, {'data': [
-        {'id': 'guidance', 'owned_by': 'vllm', 'root': 'nvidia/Qwen3.6-35B-A3B-NVFP4', 'max_model_len': 32768},
+        {'id': 'reason-a', 'owned_by': 'vllm', 'root': 'nvidia/Qwen3.6-35B-A3B-NVFP4', 'max_model_len': 32768},
         {'id': 'bare'}]})})
     obs = probes.probe_service(Service('s', 'h', url=url + '/v1'), 0)
-    assert obs.models == ['guidance', 'bare']
-    assert obs.served == [{'id': 'guidance', 'root': 'nvidia/Qwen3.6-35B-A3B-NVFP4', 'max_model_len': 32768},
+    assert obs.models == ['reason-a', 'bare']
+    assert obs.served == [{'id': 'reason-a', 'root': 'nvidia/Qwen3.6-35B-A3B-NVFP4', 'max_model_len': 32768},
                           {'id': 'bare', 'root': None, 'max_model_len': None}]
 
 
 def test_engine_progress_counter_is_read_from_the_same_metrics(fake):
-    url = fake({'/v1/models': (200, {'data': [{'id': 'guidance'}]}),
-                '/metrics': (200, 'vllm:num_requests_running{engine="0",model_name="guidance"} 1.0\n'
-                                  'vllm:iteration_tokens_total_count{engine="0",model_name="guidance"} 245824.0\n'
-                                  'vllm:iteration_tokens_total_sum{engine="0",model_name="guidance"} 9.9e6\n'
-                                  'vllm:generation_tokens_total{engine="0",model_name="guidance"} 246122.0\n')})
-    obs = probes.probe_service(Service('s', 'h', url=url + '/v1', models=['guidance']), 0)
+    url = fake({'/v1/models': (200, {'data': [{'id': 'reason-a'}]}),
+                '/metrics': (200, 'vllm:num_requests_running{engine="0",model_name="reason-a"} 1.0\n'
+                                  'vllm:iteration_tokens_total_count{engine="0",model_name="reason-a"} 245824.0\n'
+                                  'vllm:iteration_tokens_total_sum{engine="0",model_name="reason-a"} 9.9e6\n'
+                                  'vllm:generation_tokens_total{engine="0",model_name="reason-a"} 246122.0\n')})
+    obs = probes.probe_service(Service('s', 'h', url=url + '/v1', models=['reason-a']), 0)
     assert (obs.in_flight, obs.progress) == (1, 245824.0)
-    url = fake({'/v1/models': (200, {'data': [{'id': 'eecom-chat'}]}),
+    url = fake({'/v1/models': (200, {'data': [{'id': 'chat-small'}]}),
                 '/metrics': (200, 'llamacpp:requests_processing 1\nllamacpp:n_decode_total 77\n')})
     assert probes.engine_load(url + '/v1') == (1, 77.0)
     url = fake({'/v1/models': (200, {'data': [{'id': 'm'}]}),
@@ -82,27 +82,27 @@ vllm:num_requests_running{model_name="Qwen3.8",engine="0"} %(running)d
 # HELP vllm:num_requests_waiting Number of requests waiting to be processed.
 # TYPE vllm:num_requests_waiting gauge
 vllm:num_requests_waiting{model_name="Qwen3.8",engine="0"} 0
-# HELP radiance:engine_steps_total Scheduler steps executed.
-# TYPE radiance:engine_steps_total counter
-radiance:engine_steps_total{model_name="Qwen3.8",engine="0"} %(steps)d
-# HELP radiance:engine_steps_prefill_total Scheduler steps carrying only prefill chunks.
-# TYPE radiance:engine_steps_prefill_total counter
-radiance:engine_steps_prefill_total{model_name="Qwen3.8",engine="0"} 2389
-radiance:engine_steps_decode_total{model_name="Qwen3.8",engine="0"} 17104
-radiance:num_requests_preempted{model_name="Qwen3.8",engine="0"} 0
+# HELP native:engine_steps_total Scheduler steps executed.
+# TYPE native:engine_steps_total counter
+native:engine_steps_total{model_name="Qwen3.8",engine="0"} %(steps)d
+# HELP native:engine_steps_prefill_total Scheduler steps carrying only prefill chunks.
+# TYPE native:engine_steps_prefill_total counter
+native:engine_steps_prefill_total{model_name="Qwen3.8",engine="0"} 2389
+native:engine_steps_decode_total{model_name="Qwen3.8",engine="0"} 17104
+native:num_requests_preempted{model_name="Qwen3.8",engine="0"} 0
 """
 
 
-def test_native_radiance_progress_is_engine_steps_total_only(fake):
-    # Lines from a real native /metrics scrape (native-radiance-2026-10-07/w3/logs/native-c2-metrics-end.txt).
-    # Only radiance:engine_steps_total counts; the prefill/decode sub-counters must not be added in.
+def test_native_engine_progress_is_engine_steps_total_only(fake):
+    # Lines from a real native /metrics scrape (a native engine capture).
+    # Only native:engine_steps_total counts; the prefill/decode sub-counters must not be added in.
     url = fake({'/v1/models': (200, {'data': [{'id': 'Qwen3.8'}]}),
                 '/metrics': (200, NATIVE_METRICS % {'running': 2, 'steps': 19493})})
     obs = probes.probe_service(Service('s', 'h', url=url + '/v1', models=['Qwen3.8']), 0)
     assert (obs.state, obs.in_flight, obs.progress) == ('up', 2, 19493.0)
 
 
-def test_native_radiance_frozen_steps_with_requests_in_flight_read_as_wedged(fake):
+def test_native_engine_frozen_steps_with_requests_in_flight_read_as_wedged(fake):
     # Same flow the monitor runs: two probes, then carry_stall, then the wedge check.
     routes = {'/v1/models': (200, {'data': [{'id': 'Qwen3.8'}]}),
               '/metrics': (200, NATIVE_METRICS % {'running': 1, 'steps': 500})}
@@ -118,8 +118,8 @@ def test_native_radiance_frozen_steps_with_requests_in_flight_read_as_wedged(fak
 
 def test_wrong_model_auth_and_down(fake):
     url = fake({'/v1/models': (200, {'data': [{'id': 'glm-5.3'}]})})
-    obs = probes.probe_service(Service('s', 'h', url=url + '/v1', models=['guidance']), 0)
-    assert obs.state == 'wrong' and obs.detail == 'serving glm-5.3; expected guidance'
+    obs = probes.probe_service(Service('s', 'h', url=url + '/v1', models=['reason-a']), 0)
+    assert obs.state == 'wrong' and obs.detail == 'serving glm-5.3; expected reason-a'
     url = fake({'/v1/models': (401, '')})
     assert probes.probe_service(Service('s', 'h', url=url + '/v1'), 0).state == 'unverified'
     obs = probes.probe_service(Service('s', 'h', url='http://127.0.0.1:9/v1'), 0)
@@ -127,9 +127,9 @@ def test_wrong_model_auth_and_down(fake):
 
 
 def test_llama_cpp_slots_fallback(fake):
-    url = fake({'/v1/models': (200, {'data': [{'id': 'eecom-chat'}]}),
+    url = fake({'/v1/models': (200, {'data': [{'id': 'chat-small'}]}),
                 '/slots': (200, [{'is_processing': True}, {'is_processing': False}])})
-    assert probes.probe_service(Service('s', 'h', url=url + '/v1', models=['eecom-chat']), 0).in_flight == 1
+    assert probes.probe_service(Service('s', 'h', url=url + '/v1', models=['chat-small']), 0).in_flight == 1
 
 
 def test_collector_host_memory_and_amd_device(fake):

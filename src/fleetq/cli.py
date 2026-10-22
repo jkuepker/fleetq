@@ -661,9 +661,9 @@ def render_status(st, only_host=None, width=None, color=False):
         for s in h['services']:
             mark = '!' if s['warn'] else MARK.get(s['status'], '!')
             roles = ', '.join(s['roles']) or s['kind']
-            flight = f' · {s["in_flight"]} in flight' if s['in_flight'] else ''
+            busy_note = f' · {s["in_flight"]} in flight' if s['in_flight'] else ''
             lead = f'    {mark} {s["name"]:<22} {roles:<26} {s["mem_gb"]:>4g} GB  '
-            out = block(short(s['text']) + flight, lead)
+            out = block(short(s['text']) + busy_note, lead)
             if mark != '+':
                 out[0] = out[0][:4] + paint('31' if mark in '!?' else '33', mark) + out[0][5:]
             lines += out
