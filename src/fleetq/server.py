@@ -21,7 +21,8 @@ from .store import Store
 DEFAULTS = {'listen': '0.0.0.0', 'port': 8470, 'token_file': '/etc/fleetq/token',
             'db': '/var/lib/fleetq/fleetq.db', 'probe_interval_s': 30, 'stale_heartbeat_s': 180,
             'restore_grace_s': 600, 'machine_probe_port': 22, 'default_expect_min': 120,
-            'untracked_gb_warn': 6, 'wedge_after_s': 180, 'fast_probe_s': 5}
+            'untracked_gb_warn': 6, 'wedge_after_s': 180, 'unclaimed_after_s': 600,
+            'fast_probe_s': 5}
 MAX_WAIT_S = 30  # longest a GET /v1/jobs/<id>?wait=N holds the request open
 
 
@@ -108,7 +109,16 @@ class Fleet:
         if job.state == RUNNING and job.expect_s and job.started_at \
                 and now > job.started_at + job.expect_s:
             flags.append(f'overdue: expected {human(job.expect_s)}, running {human(now - job.started_at)}')
+        if self._unclaimed(job, now):
+            flags.append(f'unclaimed: started {human(now - job.started_at)} ago, no client has checked on it '
+                         f'for {human(now - job.seen_at)}; whoever waited for it may be gone')
         return flags
+
+    def _unclaimed(self, job, now):
+        """A running lease nobody has looked at since it started, last seen unclaimed_after_s ago."""
+        return (job.state == RUNNING and job.kind == 'lease' and job.seen_at is not None
+                and job.started_at is not None and job.seen_at < job.started_at
+                and now - job.seen_at > self.cfg['unclaimed_after_s'])
 
     def _job_dict(self, job, now, position=None):
         d = asdict(job)
@@ -120,14 +130,14 @@ class Fleet:
 
     # ---- scheduling ----------------------------------------------------
     def step(self):
-        """Clear confirmed restores, drop abandoned queued runs, start whatever may start."""
+        """Clear confirmed restores, drop abandoned waiters, start whatever may start, flag unclaimed leases."""
         now = self.clock()
         for name, rest in self.store.restores().items():
             if core.restored(self.obs.get(name), rest):
                 self.store.clear_restore(name)
                 self.store.event(now, 'restored', f'{name} is back after #{rest.job_id}', rest.job_id, name)
         for job in self.store.active_jobs():
-            if job.state == QUEUED and job.kind == 'run' and job.heartbeat_at \
+            if job.state == QUEUED and (job.kind == 'run' or job.watch) and job.heartbeat_at \
                     and now - job.heartbeat_at > self.cfg['stale_heartbeat_s']:
                 self.store.update_job(job.id, state=CANCELLED, ended_at=now,
                                       note='client stopped waiting (no heartbeat)')
@@ -141,6 +151,11 @@ class Fleet:
                 self.store.event(now, 'started', f'#{job.id} started on {", ".join(job.hosts)}: {job.label}', job.id)
             elif job.id in reasons and reasons[job.id] != job.reason:
                 self.store.update_job(job.id, reason=reasons[job.id])
+        for job in self.store.active_jobs():
+            if self._unclaimed(job, now) and not self.store.has_event(job.id, 'unclaimed'):
+                self.store.event(now, 'unclaimed', f'#{job.id} started but no client has checked on it for '
+                                 f'{human(now - job.seen_at)}: {job.label}', job.id)
+
         with self.changed:
             self.version += 1
             self.changed.notify_all()
@@ -151,7 +166,7 @@ class Fleet:
         deadline = time.monotonic() + wait_s
         with self.changed:
             seen = self.version
-        first = self.get(job_id)
+        first = self.get(job_id, seen=True)
         if state is not None and first['state'] != state:
             return first
         job = first
@@ -159,7 +174,7 @@ class Fleet:
             with self.changed:
                 self.changed.wait_for(lambda: self.version != seen, left)
                 seen = self.version
-            job = self.get(job_id)
+            job = self.get(job_id, seen=True)
             if job['state'] != first['state'] or job['reason'] != first['reason']:
                 break
         return job
@@ -298,22 +313,27 @@ class Fleet:
             expect_s = p.get('expect_min')
             if kind == 'lease' and expect_s is None:
                 expect_s = self.cfg['default_expect_min']
+            watch = kind == 'lease' and bool(p.get('watch'))
             job = Job(0, QUEUED, kind, owner, label[:200], hosts, mem, bool(p.get('exclusive')),
-                      uses, takes, created_at=now, heartbeat_at=now if kind == 'run' else None,
+                      uses, takes, created_at=now, heartbeat_at=now if kind == 'run' or watch else None,
                       expect_s=float(expect_s) * 60 if expect_s else None,
                       command=str(p.get('command', ''))[:500], note=str(p.get('note', ''))[:500],
                       mem_map={h: gb for h, gb in mem_map.items() if gb != mem},
-                      serves=serves[:8], serves_caps=serves_caps)
+                      serves=serves[:8], serves_caps=serves_caps, watch=watch, seen_at=now)
             self.store.add_job(job)
             self.store.event(now, 'queued', f'#{job.id} queued by {owner} on {", ".join(hosts)}: {job.label}', job.id)
             self.step()
             return self.get(job.id)
 
-    def get(self, job_id):
+    def get(self, job_id, seen=False):
+        """The job with flags and place in line; seen=True records that a client looked at it."""
         with self.lock:
             job = self.store.job(job_id)
             if not job:
                 raise ApiError(404, f'no job #{job_id}')
+            if seen and job.state in (QUEUED, RUNNING):
+                job.seen_at = self.clock()
+                self.store.update_job(job_id, seen_at=job.seen_at)
             position = None
             if job.state == QUEUED:
                 queued = [j for j in self.store.active_jobs() if j.state == QUEUED]
@@ -326,8 +346,19 @@ class Fleet:
             if not job:
                 raise ApiError(404, f'no job #{job_id}')
             if job.state in (QUEUED, RUNNING):
-                self.store.update_job(job_id, heartbeat_at=self.clock())
+                now = self.clock()
+                self.store.update_job(job_id, heartbeat_at=now, seen_at=now)
             return self.get(job_id)
+
+    def unwatch(self, job_id):
+        """The waiting client stops on purpose (Ctrl-C, --wait-timeout): the lease keeps its place."""
+        with self.lock:
+            job = self.store.job(job_id)
+            if not job:
+                raise ApiError(404, f'no job #{job_id}')
+            if job.watch:
+                self.store.update_job(job_id, watch=0)
+            return self.get(job_id, seen=True)
 
     def release(self, job_id, p):
         with self.lock:
@@ -532,7 +563,7 @@ def make_handler(fleet, token, readonly_token=None):
                     if method == 'GET' and len(route) == 2:
                         q = parse_qs(url.query)
                         if 'wait' not in q:
-                            return self._send(200, fleet.get(job_id))
+                            return self._send(200, fleet.get(job_id, seen=True))
                         try:
                             wait_s = min(max(float(q['wait'][0]), 0.0), MAX_WAIT_S)
                         except ValueError:
@@ -541,6 +572,8 @@ def make_handler(fleet, token, readonly_token=None):
                         return self._send(200, fleet.wait_job(job_id, wait_s, state) | {'waited': wait_s})
                     if method == 'POST' and route[2:] == ['heartbeat']:
                         return self._send(200, fleet.heartbeat(job_id))
+                    if method == 'POST' and route[2:] == ['unwatch']:
+                        return self._send(200, fleet.unwatch(job_id))
                     if method == 'POST' and route[2:] == ['release']:
                         return self._send(200, fleet.release(job_id, self._body()))
                 if method == 'POST' and len(route) == 3 and route[0] == 'services' and route[2] == 'mark-up':

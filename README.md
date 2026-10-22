@@ -177,8 +177,15 @@ the command never ran. `acquire --wait` also returns 4 then.
    reports free.
 3. **Only the owner releases** a job (`--force` overrides, and the log records it).
    fleetq never releases running work by itself. A `run` job whose client stops
-   heartbeating is flagged stale; a lease past `--expect` is flagged overdue.
-4. A queued `run` job whose client disappeared is dropped from the line.
+   heartbeating is flagged stale; a lease past `--expect` is flagged overdue. A lease that
+   started while no client had looked at it (heartbeat, `fleetq show`/`wait`, or a
+   `FLEETQ_JOB` command inside it) for `unclaimed_after_s` (default 600 s) is flagged
+   unclaimed, and the log records it once; the first client that looks at it clears the flag.
+4. **Waiters that vanish leave the line.** A queued `run` job, or a lease queued by
+   `acquire --wait`, whose client stops heartbeating for `stale_heartbeat_s` (default 180 s)
+   is dropped, so a killed agent tool call does not later hold a box nobody uses. Ctrl-C or
+   `--wait-timeout` on `acquire --wait` keeps the lease in line, as does `acquire` without
+   `--wait` (it never heartbeats).
 5. **Wedged servers.** A service that reports requests in flight while its engine step
    counter (vLLM `iteration_tokens_total_count`, llama.cpp `n_decode_total`) stays frozen
    for `wedge_after_s` (default 180 s) shows as `WEDGED`. vLLM on GB10 freezes like this

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import fields
 
 from .core import Job, Restore
 
@@ -15,7 +16,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at REAL NOT NULL, started_at REAL, ended_at REAL, heartbeat_at REAL, expect_s REAL,
   command TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', exit_code INTEGER,
   note TEXT NOT NULL DEFAULT '', mem_map TEXT NOT NULL DEFAULT '{}',
-  serves TEXT NOT NULL DEFAULT '[]', serves_caps TEXT NOT NULL DEFAULT '[]');
+  serves TEXT NOT NULL DEFAULT '[]', serves_caps TEXT NOT NULL DEFAULT '[]',
+  watch INTEGER NOT NULL DEFAULT 0, seen_at REAL);
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
 CREATE TABLE IF NOT EXISTS restores (
   service TEXT PRIMARY KEY, job_id INTEGER NOT NULL, owner TEXT NOT NULL, label TEXT NOT NULL,
@@ -25,9 +27,12 @@ CREATE TABLE IF NOT EXISTS events (
   kind TEXT NOT NULL, text TEXT NOT NULL);
 """
 
+JOB_FIELDS = {f.name for f in fields(Job)}
 JSON_FIELDS = ('hosts', 'uses', 'takes_down', 'mem_map', 'serves', 'serves_caps')
 # Columns added after the first schema; older databases gain them in place.
-ADDED = {'mem_map': "'{}'", 'serves': "'[]'", 'serves_caps': "'[]'"}
+ADDED = {'mem_map': "TEXT NOT NULL DEFAULT '{}'", 'serves': "TEXT NOT NULL DEFAULT '[]'",
+         'serves_caps': "TEXT NOT NULL DEFAULT '[]'", 'watch': 'INTEGER NOT NULL DEFAULT 0',
+         'seen_at': 'REAL'}
 
 
 class Store:
@@ -39,26 +44,28 @@ class Store:
         self.db.execute('PRAGMA synchronous=FULL')
         self.db.executescript(SCHEMA)
         have = {r['name'] for r in self.db.execute('PRAGMA table_info(jobs)')}
-        for col, default in ADDED.items():
+        for col, ddl in ADDED.items():
             if col not in have:
-                self.db.execute(f'ALTER TABLE jobs ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}')
+                self.db.execute(f'ALTER TABLE jobs ADD COLUMN {col} {ddl}')
 
     def _job(self, row):
         data = dict(row)
         for f in JSON_FIELDS:
             data[f] = json.loads(data[f])
         data['exclusive'] = bool(data['exclusive'])
-        return Job(**data)
+        data['watch'] = bool(data['watch'])
+        # Columns a newer version added are ignored, so rolling back never breaks reading jobs.
+        return Job(**{k: v for k, v in data.items() if k in JOB_FIELDS})
 
     def add_job(self, job):
         cur = self.db.execute(
             'INSERT INTO jobs (state, kind, owner, label, hosts, mem_gb, exclusive, uses, takes_down, '
-            'created_at, heartbeat_at, expect_s, command, note, mem_map, serves, serves_caps) '
-            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            'created_at, heartbeat_at, expect_s, command, note, mem_map, serves, serves_caps, watch, seen_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (job.state, job.kind, job.owner, job.label, json.dumps(job.hosts), job.mem_gb,
              int(job.exclusive), json.dumps(job.uses), json.dumps(job.takes_down), job.created_at,
              job.heartbeat_at, job.expect_s, job.command, job.note, json.dumps(job.mem_map),
-             json.dumps(job.serves), json.dumps(job.serves_caps)))
+             json.dumps(job.serves), json.dumps(job.serves_caps), int(job.watch), job.seen_at))
         job.id = cur.lastrowid
         return job
 
@@ -96,6 +103,10 @@ class Store:
     def event(self, at, kind, text, job_id=None, service=None):
         self.db.execute('INSERT INTO events (at, job_id, service, kind, text) VALUES (?,?,?,?,?)',
                         (at, job_id, service, kind, text))
+
+    def has_event(self, job_id, kind):
+        return self.db.execute('SELECT 1 FROM events WHERE job_id = ? AND kind = ? LIMIT 1',
+                               (job_id, kind)).fetchone() is not None
 
     def events(self, limit=30):
         rows = self.db.execute('SELECT * FROM events ORDER BY id DESC LIMIT ?', (limit,))

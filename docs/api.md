@@ -86,7 +86,9 @@ spans several hosts shows up under each of them.
   "created_at": 1761062000.0, "started_at": null, "ended_at": null, "heartbeat_at": null,
   "expect_s": 5400, "command": "", "reason": "waiting: needs 40 GB on spark2; 30 GB free",
   "exit_code": null, "note": "", "serves": [], "serves_caps": [],
-  "flags": ["stale", "overdue"]          // empty when healthy
+  "watch": false,                        // lease queued by `acquire --wait`; its client heartbeats it
+  "seen_at": 1761062000.0,               // last client contact: submit, heartbeat, unwatch, GET
+  "flags": ["stale: ...", "overdue: ...", "unclaimed: ..."]   // empty when healthy
 }
 ```
 
@@ -112,7 +114,8 @@ services are listed. The README's "Find a model to use" section covers the detai
 | Route | Body | Does |
 |---|---|---|
 | `POST /v1/jobs` | job request (below) | queues a job and answers with it; starts it at once if it fits |
-| `POST /v1/jobs/<id>/heartbeat` | none | keeps a `run` job from being flagged stale or dropped |
+| `POST /v1/jobs/<id>/heartbeat` | none | keeps a `run` job or a watched lease from being flagged stale or dropped |
+| `POST /v1/jobs/<id>/unwatch` | none | the waiting client stops on purpose: the lease stays queued without heartbeats |
 | `POST /v1/jobs/<id>/release` | `{"owner", "note"?, "exit_code"?, "force"?}` | finishes a running job or cancels a queued one; only the owner may, unless `force` |
 | `POST /v1/resolve` | job request | answers `{hosts, uses, takes_down, url_service, mem_map}` without queueing |
 | `POST /v1/probe` | none | runs the health checks now and answers with the status |
@@ -130,11 +133,17 @@ Job request (`label` and `owner` are required):
   "exclusive": false,
   "uses": ["review"], "takes_down": [],   // roles or service names
   "expect_min": 90,                 // leases are flagged overdue after this
+  "watch": false,                   // leases: you heartbeat it while queued; stop and it is dropped
   "serves": ["http://gpu-b:8001/v1"], "serves_caps": ["text", "image"],
   "note": "", "command": ""
 }
 ```
 
-Long-poll `GET /v1/jobs/<id>?wait=25&state=queued` until `state` is `running`, do the work, then release. A harness
+Long-poll `GET /v1/jobs/<id>?wait=25&state=queued` until `state` is `running`, do the work, then
+release. Each GET (long polls included) and heartbeat counts as client contact. A lease that
+starts while no client has contacted it for `unclaimed_after_s` (server config, default 600 s)
+is flagged `unclaimed` and logged once; the next contact clears the flag, and fleetq never
+releases it. With `"watch": true`, heartbeat at least every 180 s (`stale_heartbeat_s`) while
+queued, and call `unwatch` before you stop waiting if the lease should keep its place. A harness
 that only sends requests to an existing server should hold a shared lease with `uses` on
 that service's role, so nobody takes it down mid-run.

@@ -97,6 +97,8 @@ class Job:
     mem_map: dict = field(default_factory=dict)  # host -> GB where it differs from mem_gb
     serves: list = field(default_factory=list)       # model server URLs this job brings up
     serves_caps: list = field(default_factory=list)  # capabilities of the models at those URLs
+    watch: bool = False                  # leases: a waiting client heartbeats it while queued
+    seen_at: float | None = None         # last client contact (submit, heartbeat, GET)
 
     def brief(self):
         return f'#{self.id} "{self.label}" ({self.owner})'

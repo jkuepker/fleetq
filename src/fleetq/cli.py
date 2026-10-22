@@ -444,16 +444,28 @@ def cmd_run(client, args):
     return code
 
 
+def unwatch(client, job_id):
+    """Tell the server this waiter stops on purpose, so the lease keeps its place without heartbeats."""
+    try:
+        client.call('POST', f'/v1/jobs/{job_id}/unwatch', {})
+    except (Unreachable, ApiError) as exc:
+        say(f'could not tell the server #{job_id} should stay in line without a waiter ({exc}); '
+            'it may be dropped from the line')
+
+
 def cmd_acquire(client, args):
-    job = client.call('POST', '/v1/jobs', job_payload(args, 'lease'))
+    # With --wait this client heartbeats the queued lease; if it is killed, the server drops the lease.
+    job = client.call('POST', '/v1/jobs', {**job_payload(args, 'lease'), 'watch': bool(args.wait)})
     if args.wait and job['state'] == 'queued':
         timeout_s = args.wait_timeout * 60 if args.wait_timeout else None
         try:
-            got = wait_until_running(client, job, timeout_s, heartbeat=False)
+            got = wait_until_running(client, job, timeout_s, heartbeat=True)
         except KeyboardInterrupt:
+            unwatch(client, job['id'])
             say(f'stopped waiting; #{job["id"]} is still in line (fleetq release {job["id"]} to leave)')
             return 130
         if got is None:
+            unwatch(client, job['id'])
             say(f'#{job["id"]} still in line after {args.wait_timeout} min; it keeps its place')
             job = client.call('GET', f'/v1/jobs/{job["id"]}')
             emit(args, job, describe(job))
