@@ -23,23 +23,50 @@ probe_interval_s = 30
 # and the --serves URLs of running jobs that are still starting (0 = off).
 fast_probe_s = 5
 stale_heartbeat_s = 180
+# A reserved slot nobody claims within this long of its start lapses.
+noshow_after_s = 900
 restore_grace_s = 600
+# Events older than this many days are dropped, at most once a day (0 keeps everything).
+events_keep_days = 180
 default_expect_min = 120
+# Jobs may name their own notify URL (fleetq run/acquire/reserve --notify URL). That makes the
+# server POST to a URL a client chose, so it is off unless you turn it on, and then limited to
+# these hosts (globs allowed). The [[notify]] entries below are not restricted.
+job_notify = false
+job_notify_hosts = ["ntfy.sh"]
+
+# ---- notifications ----------------------------------------------------------
+# Tell someone when a job starts, overruns, goes stale and so on. An ntfy.sh topic gets plain
+# text with a title; any other URL gets JSON {kind, text, job, service, at}. Optional keys:
+#   kinds       which events to send (default: started done overdue stale unclaimed overrun lapsed
+#               abandoned not_restored wedged wedge-cleared restored)
+#   owners      globs on the job's owner
+#   format      "ntfy" or "json", to override the guess (use "ntfy" for a self-hosted ntfy)
+#   token_file  path to a file holding a Bearer token, for a target that needs a login
+# See docs/notify.md. Uncomment and edit:
+# [[notify]]
+# url = "https://ntfy.sh/my-fleet-alerts"
+# kinds = ["overdue", "stale", "unclaimed", "overrun", "lapsed", "not_restored", "wedged"]
+#
+# [[notify]]
+# url = "https://ntfy.example.com/fleet-alerts"   # a self-hosted ntfy that needs a login
+# format = "ntfy"
+# token_file = "/etc/fleetq/ntfy.token"
 
 # ---- hosts: one per memory pool --------------------------------------------
 
 [[host]]
-name = "spark1"
+name = "gpu-a"
 machine = "gpu-a"                     # ssh / DNS name of the box
 aliases = ["gpu-a"]
 addresses = ["192.0.2.11", "100.64.0.11"]   # every address a URL might use for this box
 capacity_gb = 116                     # unified memory, less what the OS needs
 collector = "http://gpu-a:19108"      # optional hardware collector (free memory, GPU busy)
-collector_token_file = "/etc/fleetq/collectors/spark1.token"
+collector_token_file = "/etc/fleetq/collectors/gpu-a.token"
 collector_memory = "host"
 
 [[host]]
-name = "spark2"
+name = "gpu-b"
 machine = "gpu-b"
 aliases = ["gpu-b"]
 addresses = ["192.0.2.12", "100.64.0.12"]
@@ -79,8 +106,8 @@ collector_memory = "0000:07:00.0"
 # ---- services ---------------------------------------------------------------
 
 [[service]]
-name = "spark1-vllm"
-host = "spark1"
+name = "gpu-a-vllm"
+host = "gpu-a"
 url = "http://gpu-a:8000/v1"
 models = ["chat"]                     # model ids the health check expects to see
 roles = ["chat", "planner"]           # what other tools call it; --uses / --takes-down accept these
@@ -89,8 +116,8 @@ mem_gb = 64
 note = "vLLM, 32K context"
 
 [[service]]
-name = "spark2-vllm"
-host = "spark2"
+name = "gpu-b-vllm"
+host = "gpu-b"
 url = "http://gpu-b:8000/v1"
 models = ["chat"]
 roles = ["review"]
@@ -125,7 +152,7 @@ mem_gb = 31
 
 [[service]]
 name = "scratch-server"
-host = "spark2"
+host = "gpu-b"
 kind = "optional"
 probe_tcp = "gpu-b:8710"
 mem_gb = 21
