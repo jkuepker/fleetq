@@ -15,7 +15,7 @@ import time
 import tomllib
 from urllib.parse import parse_qs, urlparse
 
-from . import core, notify, probes, stats
+from . import core, learn, notify, probes, stats
 from .core import ACTIVE, DONE, CANCELLED, QUEUED, RUNNING, Host, Job, Restore, Service
 from .store import Store
 
@@ -24,9 +24,11 @@ DEFAULTS = {'listen': '0.0.0.0', 'port': 8470, 'token_file': '/etc/fleetq/token'
             'restore_grace_s': 600, 'machine_probe_port': 22, 'default_expect_min': 120,
             'untracked_gb_warn': 6, 'wedge_after_s': 180, 'events_keep_days': 180,
             'unclaimed_after_s': 600, 'fast_probe_s': 5, 'noshow_after_s': 900,
-            'job_notify': False, 'job_notify_hosts': ['ntfy.sh']}
+            'job_notify': False, 'job_notify_hosts': ['ntfy.sh'], 'learn_days': 30,
+            'learn_min_samples': 3, 'learn_quantile': 0.8, 'learn_factor': 1.25}
 MAX_STATS_DAYS = 3650
 MAX_WAIT_S = 30  # longest a GET /v1/jobs/<id>?wait=N holds the request open
+LEARN_CACHE_S = 300  # how long finished-job history is reused between submits
 
 
 def load_config(path):
@@ -87,6 +89,7 @@ class Fleet:
         self.last_probe = None
         self.last_prune = None
         self.stepped_at = None    # server clock at the last scheduling pass
+        self.learned = {}         # job kind -> (read at, learn.index of its finished jobs)
         self.collectors = {}
         for name, h in self.host_cfg.items():
             token_file = h.get('collector_token_file')
@@ -132,9 +135,10 @@ class Fleet:
                 and now - job.heartbeat_at > self.cfg['stale_heartbeat_s']:
             flags.append(f'stale: no heartbeat for {human(now - job.heartbeat_at)}; '
                          'the client may be gone, the work may still be running')
-        if job.state == RUNNING and job.expect_s and job.started_at \
-                and now > job.started_at + job.expect_s:
-            flags.append(f'overdue: expected {human(job.expect_s)}, running {human(now - job.started_at)}')
+        if job.state == RUNNING and job.overdue_after() and job.started_at \
+                and now > job.started_at + job.overdue_after():
+            flags.append(f'overdue: expected {human(job.estimate_s())}{self._guess(job)}, '
+                         f'running {human(now - job.started_at)}')
         if self._unclaimed(job, now):
             flags.append(f'unclaimed: started {human(now - job.started_at)} ago, no client has checked on it '
                          f'for {human(now - job.seen_at)}; whoever waited for it may be gone')
@@ -158,6 +162,11 @@ class Fleet:
                     flags.append(f'GPU on {h} is {util:.0%} busy, but no job there declares --load gpu; if this '
                                  'job uses the GPU, queue it again with --load gpu')
         return flags
+
+    @staticmethod
+    def _guess(job):
+        """' (learned from 9 runs)' after a learned expect, else nothing."""
+        return f' (learned from {job.expect_n} runs)' if job.expect_source == core.LEARNED else ''
 
     def _unclaimed(self, job, now, reserved=False):
         """A running lease nobody has looked at since it started. Plain leases: last seen
@@ -251,9 +260,9 @@ class Fleet:
                     and not self.store.has_event_since('stale', job.heartbeat_at, job.id):
                 self.store.event(now, 'stale', f'#{job.id} has sent no heartbeat for '
                                  f'{human(now - job.heartbeat_at)}; its client may be gone: {job.label}', job.id)
-            if job.expect_s and job.started_at and now > job.started_at + job.expect_s \
+            if job.overdue_after() and job.started_at and now > job.started_at + job.overdue_after() \
                     and not self.store.has_event(job.id, 'overdue'):
-                self.store.event(now, 'overdue', f'#{job.id} expected {human(job.expect_s)}, running '
+                self.store.event(now, 'overdue', f'#{job.id} expected {human(job.estimate_s())}{self._guess(job)}, running '
                                  f'{human(now - job.started_at)}: {job.label}', job.id)
         for name, st in statuses.items():
             if st.code == 'not_restored' and name in restores:
@@ -495,8 +504,23 @@ class Fleet:
         if start_at is not None:
             if expect_s is None:
                 raise ApiError(400, 'a reservation needs a length: --for (reserve) or --expect (run --at)')
-        if kind == 'lease' and expect_s is None:
-            expect_s = self.cfg['default_expect_min']
+        source, learned_n, learned_s, refused = core.GIVEN, 0, None, None
+        if expect_s is None:
+            source = core.DEFAULT
+            auto = None
+            if p.get('expect_auto'):
+                auto, refused = self.auto_expect(kind, label, owner, hosts, now)
+            if auto:
+                expect_s, source, learned_n = auto.seconds / 60, core.GIVEN, auto.n  # asked for: as good as said
+            else:
+                # A learned estimate goes in expect_learned_s only. expect_s keeps what an older scheduler
+                # would read it as (the lease default, or nothing), so a rollback never stops a job on a guess.
+                if kind == 'lease':
+                    expect_s = self.cfg['default_expect_min']
+                guess = self.learned_expect(kind, label, owner, hosts, now)
+                learned_n = guess.n
+                if guess.source == core.LEARNED:
+                    source, learned_s = core.LEARNED, guess.seconds
         watch = kind == 'lease' and bool(p.get('watch'))
         notify_url = str(p.get('notify') or '').strip()
         if notify_url:
@@ -509,13 +533,42 @@ class Fleet:
             if not self._job_url_ok(notify_url):
                 raise ApiError(400, f'--notify may only name {", ".join(self.cfg["job_notify_hosts"])} '
                                     f'(job_notify_hosts), not {urlparse(notify_url).hostname}')
-        return Job(0, QUEUED, kind, owner, label[:200], hosts, mem, bool(p.get('exclusive')),
+        built = Job(0, QUEUED, kind, owner, label[:200], hosts, mem, bool(p.get('exclusive')),
                    uses, takes, created_at=now, heartbeat_at=now if kind == 'run' or watch else None,
                    expect_s=float(expect_s) * 60 if expect_s else None,
                    command=str(p.get('command', ''))[:500], note=str(p.get('note', ''))[:500],
                    mem_map={h: gb for h, gb in mem_map.items() if gb != mem},
                    serves=serves[:8], serves_caps=serves_caps, watch=watch, seen_at=now,
-                   load=load, quiet=quiet, start_at=start_at, notify=notify_url)
+                   load=load, quiet=quiet, start_at=start_at, notify=notify_url,
+                   expect_source=source, expect_n=learned_n, expect_learned_s=learned_s)
+        built.auto_refused = refused  # told to the client, not stored
+        return built
+
+    def history(self, kind, label, now):
+        """Samples of finished jobs of this kind with this label's prefix (see learn.index). They are
+        read once per kind and reused for LEARN_CACHE_S, so a submit costs a dictionary lookup."""
+        read_at, idx = self.learned.get(kind, (None, None))
+        if read_at is None or now - read_at > LEARN_CACHE_S or now < read_at:
+            idx = learn.index(self.store.finished_rows(kind, now - self.cfg['learn_days'] * 86400))
+            self.learned[kind] = (now, idx)
+        return idx.get(stats.label_prefix(label))
+
+    def auto_expect(self, kind, label, owner, hosts, now):
+        """(Estimate, None) if --expect auto may take the learned estimate as given, else (None, why not)."""
+        if self.cfg['learn_days'] <= 0:
+            return None, 'learning is turned off on this server'
+        return learn.auto_estimate(self.history(kind, label, now), stats.label_prefix(label), owner, hosts,
+                                   self.cfg['default_expect_min'] * 60, self.cfg['learn_quantile'],
+                                   self.cfg['learn_factor'])
+
+    def learned_expect(self, kind, label, owner, hosts, now):
+        """learn.Estimate for a new job from finished jobs like it. Their history is read once per
+        kind and reused for LEARN_CACHE_S, so a submit costs a dictionary lookup. learn_days = 0 turns it off."""
+        if self.cfg['learn_days'] <= 0:
+            return learn.Estimate(None, core.DEFAULT)
+        return learn.estimate(self.history(kind, label, now), owner, hosts,
+                              self.cfg['default_expect_min'] * 60, self.cfg['learn_min_samples'],
+                              self.cfg['learn_quantile'], self.cfg['learn_factor'])
 
     def submit(self, p):
         with self.lock, self.store.transaction():
@@ -528,7 +581,10 @@ class Fleet:
             self.store.event(now, 'reserved' if booked else 'queued', f'#{job.id} {"reserved" if booked else "queued"}'
                              f' by {job.owner} on {", ".join(job.hosts)}{booked}: {job.label}', job.id)
             self.step()
-            return self.get(job.id)
+            out = self.get(job.id)
+            if job.auto_refused:
+                out['auto_refused'] = job.auto_refused
+            return out
 
     def _check_booking(self, job, now):
         """Refuse a reservation whose window clashes with another reservation's, or with the
@@ -693,7 +749,10 @@ class Fleet:
             job.id = max((j.id for j in jobs), default=0) + 10 ** 9
             pl = self._plan(now, jobs + [job], statuses)
             out = {'now': now, 'hosts': job.hosts, 'starts_now': job.id in pl.to_start, 'reason': None,
-                   'start_in_s': 0.0 if job.id in pl.to_start else None, 'deadline_in_s': None}
+                   'start_in_s': 0.0 if job.id in pl.to_start else None, 'deadline_in_s': None,
+                   'expect_s': job.estimate_s(), 'expect_source': job.expect_source, 'expect_n': job.expect_n}
+            if job.auto_refused:
+                out['auto_refused'] = job.auto_refused
             deadline = pl.deadlines.get(job.id)
             if not out['starts_now']:
                 out['reason'] = pl.reasons.get(job.id)

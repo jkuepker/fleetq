@@ -165,7 +165,7 @@ A job may start before jobs waiting ahead of it if it holds none of them up. A `
 that would hold one up may still go first if it gives `--expect` and should end well before
 that job can start (`now + expect × 1.2 + 5 min`, with the start estimated from running jobs'
 `--expect`). It then has a deadline: `fleetq run` stops the command at that time (SIGTERM,
-SIGKILL 30 s later) and says so. Leases and run jobs without `--expect` wait their turn.
+SIGKILL 30 s later) and says so. Leases and run jobs without `--expect` (even with a learned estimate, see below) wait their turn.
 A job with a deadline runs in a session of its own, and the signals go to its whole process
 group, so `bash -c` or `uv run` cannot leave the work running. A hangup (closed terminal) is
 passed on to it, and a watchdog process stops it if fleetq itself is killed. Over `ssh` only the local ssh is
@@ -178,6 +178,43 @@ If the job it went ahead of leaves the line, the deadline is dropped.
 fleetq run --host gpu-a --expect 20 --label "quick eval" -- ./eval.sh
 fleetq when --host gpu-a --mem 40 --expect 30   # starts now? if not, the estimated start
 ```
+
+### Expected durations are learned
+
+Say how long a job takes with `--expect` and fleetq believes you. Leave it off and the server
+estimates: it takes finished jobs of the same kind (run or lease) whose label starts with the
+same word (`bench-3`, `bench_7` and `Bench: x` are all "bench"), from the last 30 days,
+preferring your own on the same hosts when it has 3 or more of them (failed runs, with a
+nonzero exit code, do not count), and uses the 80th
+percentile of their durations times 1.25, at least 2 minutes and at most the 120-minute default
+(`default_expect_min`; an estimate that hits it is just "long", and `--expect auto` ignores it).
+Fewer than 3 similar runs: no estimate, as before.
+The CLI says when it used one:
+
+```
+fleetq: #71 expect ~12m, learned from 9 similar runs; pass --expect to set it
+```
+
+`fleetq show`, `status` and `when` show it too ("expect ~12m (learned from 9 runs)"). A learned
+estimate is a guess, so it is held to a shorter leash than something you said:
+
+- It **never sets a deadline**. A run job with only a learned expect waits its turn; nothing is
+  stopped on a guess.
+- It estimates when a running job frees its box, so `fleetq when` and the queue's "estimated
+  start" work for jobs that gave no `--expect`.
+- A job is flagged overdue at twice its learned expect, not at 1x.
+- It starts ahead of a reservation only if 1.5x of it, plus the margin a backfill asks (x1.2 and
+  5 minutes), ends before the reservation does; a waiting job with a learned expect still keeps
+  a default-sized window clear for bookings.
+
+`--expect auto` (on `run`, `acquire`, `when`) opts in: the learned value counts as one you gave,
+so a `run` job may go ahead of the line with a deadline, and may be stopped there. Because of
+that it asks more than the plain estimate: 5 or more finished runs of your own (same owner),
+a label whose first word has 3 or more characters, durations that are steady (the slowest 5%
+within 3x the median) and an estimate under the default cap. Otherwise the job keeps the plain
+learned estimate (or none) and fleetq says why ("--expect auto refused: ...").
+`fleetq stats` lists learned estimates' accuracy apart from stated ones. Tune with `learn_days`,
+`learn_min_samples`, `learn_quantile`, `learn_factor` in `[server]` (`learn_days = 0` turns it off).
 
 ### Book a slot for later
 
@@ -218,7 +255,7 @@ exits 0 when `FLEETQ_JOB` covers X.
 | `--exclusive` | nothing else may run on the host meanwhile, and no untracked requests may be in flight |
 | `--load` | what it loads heavily: `gpu`, `cpu`, `net`, `disk` (default `gpu`; `none`) |
 | `--quiet` | what no other job may load meanwhile (a benchmark: `gpu,cpu`); `gpu` also waits for untracked GPU load |
-| `--expect MIN` | expected minutes: overdue flag; lets a `run` job go ahead of the line if it fits |
+| `--expect MIN\|auto` | expected minutes: overdue flag; lets a `run` job go ahead of the line if it fits. Omitted: learned from similar finished jobs (never a deadline); `auto`: take that estimate as given |
 | `--at TIME` / `--in DUR` | `run` / `reserve`: start no earlier than this (`14:30`, `tomorrow 09:00`, `90m`) |
 | `--uses` | roles/services that must be up; shared with other users |
 | `--takes-down` | roles/services this job stops; must come back afterwards |

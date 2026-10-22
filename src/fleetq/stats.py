@@ -178,13 +178,18 @@ def compute(rows, now, since, hosts=(), only=()):
     for o in owners.values():
         o['wait'] = summary(o.pop('_waits'))
 
-    expect = {}
-    for kind in ('lease', 'run'):
-        done = [r for r in rows if r['kind'] == kind and r.get('expect_s') and r.get('started_at') is not None
-                and r.get('ended_at') is not None and r['ended_at'] >= since]
-        ratios = [(r['ended_at'] - r['started_at']) / r['expect_s'] for r in done]
-        expect[kind] = {'n': len(done), 'median_ratio': percentile(ratios, 0.5),
-                        'overdue_pct': 100 * sum(1 for x in ratios if x > 1) / len(ratios) if ratios else None}
+    def accuracy(kind, learned):
+        key = 'expect_learned_s' if learned else 'expect_s'
+        done = [r for r in rows if r['kind'] == kind and r.get(key) and r.get('started_at') is not None
+                and r.get('ended_at') is not None and r['ended_at'] >= since
+                and (r.get('expect_source') == 'learned') == learned]
+        ratios = [(r['ended_at'] - r['started_at']) / r[key] for r in done]
+        return {'n': len(done), 'median_ratio': percentile(ratios, 0.5),
+                'overdue_pct': 100 * sum(1 for x in ratios if x > 1) / len(ratios) if ratios else None}
+
+    # What owners said (or the default) apart from what the server learned: the second says whether learning works.
+    expect = {kind: accuracy(kind, False) for kind in ('lease', 'run')}
+    expect_learned = {kind: accuracy(kind, True) for kind in ('lease', 'run')}
 
     by_label = defaultdict(list)
     for r in rows:
@@ -194,4 +199,4 @@ def compute(rows, now, since, hosts=(), only=()):
     labels.sort(key=lambda x: (-x['n'], x['prefix']))
 
     return {'since': since, 'until': now, 'days': wall / 86400, 'hosts': per_host, 'owners': owners,
-            'expect': expect, 'labels': labels[:MAX_LABELS]}
+            'expect': expect, 'expect_learned': expect_learned, 'labels': labels[:MAX_LABELS]}

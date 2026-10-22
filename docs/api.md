@@ -63,6 +63,8 @@ outside (0, 3650] or an unknown `host`.
 - `expect`: finished jobs that had an `expect_s`: `median_ratio` is actual duration over
   expected, `overdue_pct` the share that ran longer. Leases without `--expect` carry the
   server default (`default_expect_min`), which the rows cannot tell apart from a real estimate.
+- `expect_learned`: the same, for jobs whose `expect_s` the server learned (`expect_source`
+  `learned`); `expect` then covers only stated expects and the default.
 - `labels`: median and p90 duration by label prefix (the label up to the first space, `:`,
   `/`, `=`, `#` or `@`, trailing digits and `-_.` dropped) for prefixes with 3 or more
   finished runs, most frequent first, at most 15.
@@ -131,7 +133,10 @@ spans several hosts shows up under each of them.
   "mem_gb": 40, "mem_map": {}, "exclusive": false,
   "uses": [], "takes_down": [], "roles_taken_down": [],
   "created_at": 1761062000.0, "started_at": null, "ended_at": null, "heartbeat_at": null,
-  "expect_s": 5400, "command": "", "reason": "waiting: needs 40 GB on gpu-b; 30 GB free",
+  "expect_s": 5400, "expect_source": "given", // given | learned | default: who set expect_s (see "Learned expects")
+  "expect_n": 0, // learned: how many finished jobs it comes from
+  "expect_learned_s": null, // learned: the estimate, in seconds. expect_s is never a learned value
+  "command": "", "reason": "waiting: needs 40 GB on gpu-b; 30 GB free",
   "exit_code": null, "note": "", "serves": [], "serves_caps": [],
   "watch": false,                        // lease queued by `acquire --wait`; its client heartbeats it
   "seen_at": 1761062000.0,               // last client contact: submit, heartbeat, unwatch, GET
@@ -146,7 +151,7 @@ spans several hosts shows up under each of them.
 Act on the `_in_s` fields, not the absolute times: they are relative to the server's clock
 when it answered, so a client with a skewed clock still gets them right.
 
-Flags a running job may carry: `stale` (no heartbeat), `overdue` (past `expect_s`),
+Flags a running job may carry: `stale` (no heartbeat), `overdue` (past `expect_s`, or past twice it when `expect_source` is `learned`),
 `unclaimed`, `no-show: reserved slot started ...`, `past its backfill deadline`,
 `overrunning into reservation #X`, and `GPU on <host> is N% busy, but no job there declares
 --load gpu`. Every running job's flags are also in the status `warnings`.
@@ -193,7 +198,9 @@ Job request (`label` and `owner` are required):
   "mem_gb": 40, "mem_map": {"gpu-b": 40},
   "exclusive": false,
   "uses": ["review"], "takes_down": [],   // roles or service names
-  "expect_min": 90,                 // flagged overdue after this; lets a run job start ahead of the line
+  "expect_min": 90,
+  "expect_auto": false,   // no expect_min: true takes the learned estimate as given (needs 5 similar runs)
+                  // flagged overdue after this; lets a run job start ahead of the line
   "watch": false,                   // leases: you heartbeat it while queued; stop and it is dropped
   "load": ["gpu"],                  // gpu, cpu, net, disk: what it loads heavily (default ["gpu"]; [] = nothing)
   "quiet": [],                      // what no other job on its hosts may load while it runs
@@ -253,6 +260,27 @@ through by the second rule gets a `deadline`; `fleetq run` stops its command the
 SIGKILL 30 s later). Leases and run jobs without `expect_min` never get a deadline. The server
 clears the deadline (`deadline-cleared` event, `deadline_in_s` back to `null`) once nothing it
 went ahead of is still waiting or booked; clients should act on the latest value.
+
+**Learned expects.** A job submitted without `expect_min` gets an estimate when finished
+jobs of the same `kind` and label prefix (see `labels` in stats) exist from the last
+`learn_days` (30): the `learn_quantile` (0.8) of their durations times `learn_factor` (1.25),
+at least 2 minutes and at most `default_expect_min` (an estimate that hits it is flagged capped
+internally and `expect_auto` does not take it as given). It uses the group with at least `learn_min_samples` (3) jobs that is most
+specific: same owner and hosts, then owner, then hosts, then anyone. The job then has `expect_source: "learned"`, `expect_learned_s` (seconds) and
+`expect_n` (the group's size). `expect_s` stays what it would be without learning (the lease
+default, else `null`), so a server without this feature reads the job as it always read one
+with no `--expect`; failed runs (nonzero `exit_code`) are not counted; history is read once per kind and reused for 5 minutes. Without
+an estimate `expect_source` is `default`: leases keep `expect_s = default_expect_min`, run jobs
+`expect_s: null`. `expect_source: "given"` means `expect_min` was sent, or `expect_auto` was
+accepted: at least 5 finished jobs of the same owner (owner+hosts or owner scope), a label
+prefix of 3 or more characters, p95/median of their durations at most 3 and an estimate under
+the cap. A refused `expect_auto` leaves the plain learned estimate and adds `auto_refused: "<reason>"`
+to the response of `POST /v1/jobs` and `POST /v1/when`. Rows from before the column read as `given` when they have an `expect_s`.
+A learned expect never sets a backfill `deadline`; it does estimate a running job's end
+(`start_in_s` of what waits, `POST /v1/when`, which also answers `expect_s` (the estimate in use), `expect_source`
+and `expect_n`), flags `overdue` at twice it, and lets a job start ahead of a reservation
+only if 1.5 times it, x1.2 and plus 5 minutes (at most the default), ends before the reservation does;
+a waiting job's slot counts as `default_expect_min` long when a reservation is checked against the line. `learn_days = 0` turns learning off.
 
 **Reservations.** A job with `start_in_s` / `start_at` (and a length, `expect_min`) waits
 until its start, then goes first in line on its hosts. A start less than 60 s ahead (or in the

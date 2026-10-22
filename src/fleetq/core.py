@@ -27,6 +27,14 @@ BACKFILL_SLACK, BACKFILL_MARGIN_S = 1.2, 300
 # A reservation must start at least this far ahead; anything sooner is an ordinary queued job,
 # so a booking cannot be used to go straight to the front of the line.
 RESERVE_MIN_LEAD_S = 60
+# Where a job's expect_s came from: what its owner said (given), what finished jobs like it took
+# (learned), or the server's flat default. Only a given expect may set a deadline: nothing is
+# stopped on a guess. A learned one lives in its own field (expect_learned_s), never in expect_s,
+# so a scheduler without this feature reads such a job as it always read one with no --expect.
+# It is held to a margin everywhere else it is used.
+GIVEN, LEARNED, DEFAULT = 'given', 'learned', 'default'
+LEARNED_OVERDUE_X = 2.0  # a job with a learned expect is flagged overdue at this multiple of it
+LEARNED_PROTECT_X = 1.5  # ...and starts ahead of a reservation only if this multiple of it fits
 
 
 @dataclass
@@ -113,6 +121,41 @@ class Job:
     start_at: float | None = None        # reservations: waits until then, then goes first in line
     deadline: float | None = None        # run jobs started ahead of a waiting job: stopped by then
     notify: str = ''                     # URL told about this job's events, besides the roster's [[notify]]
+    expect_source: str = ''              # given | learned | default; '' (older rows): given if expect_s is set
+    expect_n: int = 0                    # learned: how many finished jobs it comes from
+    expect_learned_s: float | None = None  # learned: the server's estimate; expect_s stays the stated one or None
+
+    def __post_init__(self):
+        if not self.expect_source:
+            self.expect_source = GIVEN if self.expect_s else DEFAULT
+
+    def learned(self):
+        return self.expect_source == LEARNED and bool(self.expect_learned_s)
+
+    def estimate_s(self):
+        """Best guess of how long it runs: the learned one, else expect_s; None if neither."""
+        return self.expect_learned_s if self.learned() else (self.expect_s or None)
+
+    def overdue_after(self):
+        """Seconds after its start that this job is flagged overdue, or None if it has no estimate."""
+        est = self.estimate_s()
+        return est * (LEARNED_OVERDUE_X if self.learned() else 1) if est else None
+
+    def protect_s(self, default_expect_s):
+        """How long to assume it runs when deciding whether it fits ahead of a reservation. A
+        learned estimate gets the margin backfill_fits asks of a stated one, on top of its own
+        factor, and never more than the default would."""
+        if self.learned():
+            return min(self.expect_learned_s * LEARNED_PROTECT_X * BACKFILL_SLACK + BACKFILL_MARGIN_S,
+                       default_expect_s)
+        return self.expect_s or default_expect_s
+
+    def window_s(self, default_expect_s):
+        """How long its slot is taken to last when keeping a booking clear of it: a learned
+        estimate is too soft to shrink the window below the default."""
+        if self.learned():
+            return max(self.expect_learned_s, default_expect_s)
+        return self.expect_s or default_expect_s
 
     def brief(self):
         return f'#{self.id} "{self.label}" ({self.owner})'
@@ -378,7 +421,8 @@ def blocker(job, hosts, services, statuses, obs, running, host_online, actual_fr
 def expected_end(job, now):
     """When a running job (or one starting now) should be done, never before now; None if unknown."""
     start = job.started_at if job.started_at is not None else now
-    ends = [t for t in (start + job.expect_s if job.expect_s else None, job.deadline) if t is not None]
+    est = job.estimate_s()
+    ends = [t for t in (start + est if est else None, job.deadline) if t is not None]
     return max(min(ends), now) if ends else None
 
 
@@ -433,18 +477,18 @@ def _ahead_ok(job, protected, booked_ids, running, ends, starts, now, default_ex
         booked = w.id in booked_ids
         if booked and job.start_at is not None and job.start_at + (job.expect_s or default_expect_s) <= at:
             continue
-        if job.kind == 'run' and job.expect_s:
+        if job.kind == 'run' and job.expect_s and job.expect_source == GIVEN:
             if at is not None and job.expect_s <= backfill_fits(at, now):
                 deadline = at if deadline is None else min(deadline, at)
                 continue
-        elif booked and now + (job.expect_s or default_expect_s) <= at:
+        elif booked and now + job.protect_s(default_expect_s) <= at:
             continue
         if booked:
             why = f'would still be running when reservation {w.brief()} starts'
         else:
             shared = [h for h in job.hosts if h in w.hosts] or w.hosts
             why = f'in line behind {w.brief()} on {", ".join(shared)}'
-        if job.kind == 'run' and not job.expect_s:
+        if job.kind == 'run' and job.expect_source != GIVEN:
             why += f'; with --expect it may go first if it ends before {"that" if booked else "#" + str(w.id)} starts'
         return why, None
     return None, deadline
@@ -524,7 +568,7 @@ def line_windows(jobs, p, now, default_expect_s=7200.0):
     out = []
     for i in p.line:
         start = max(p.starts.get(i) or now, now)
-        out.append((by_id[i], start, start + (by_id[i].expect_s or default_expect_s)))
+        out.append((by_id[i], start, start + by_id[i].window_s(default_expect_s)))
     return out
 
 
@@ -546,7 +590,7 @@ def booked_windows(jobs, now, default_expect_s=7200.0):
         if j.start_at is None or j.state not in ACTIVE:
             continue
         start = j.started_at if j.state == RUNNING else j.start_at
-        out.append((j, start, start + (j.expect_s or default_expect_s)))
+        out.append((j, start, start + j.window_s(default_expect_s)))
     return out
 
 

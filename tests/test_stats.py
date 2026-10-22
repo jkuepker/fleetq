@@ -103,6 +103,14 @@ def test_expect_accuracy_per_kind(rows):
     assert e['run']['overdue_pct'] == 0
 
 
+def test_learned_expects_are_judged_apart_from_stated_ones(rows):
+    rows = rows + [row(9, 'a', 0, 3000, 3300, kind='run', expect_learned_s=600, expect_source='learned')]
+    st = stats.compute(rows, NOW, SINCE, ['a'])
+    assert st['expect']['run']['n'] == 1                               # the stated 1400 s only
+    assert st['expect_learned']['run']['n'] == 1 and st['expect_learned']['run']['median_ratio'] == 0.5
+    assert st['expect_learned']['lease']['n'] == 0 and st['expect_learned']['lease']['median_ratio'] is None
+
+
 def test_label_prefixes_need_three_finished_runs(rows):
     labels = stats.compute(rows, NOW, SINCE, ['a'])['labels']
     assert labels == [{'prefix': 'bench', 'n': 3, 'median_s': 1000, 'p90_s': 1000}]

@@ -169,9 +169,22 @@ def load_words(values):
     return [] if words == ['none'] else words
 
 
+def expect_arg(text):
+    """--expect: minutes, or 'auto' to take the server's learned estimate as one's own."""
+    if text.strip().lower() == 'auto':
+        return 'auto'
+    try:
+        return float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{text!r} is not a number of minutes or "auto"') from None
+
+
 def job_payload(args, kind):
     mem, mem_map = parse_mem(args.mem)
     expect = getattr(args, 'expect', None)
+    auto = expect == 'auto'
+    if auto:
+        expect = None
     if getattr(args, 'length', None):
         expect = parse_duration(args.length) / 60
     return {'kind': kind, 'label': args.label, 'owner': args.owner, 'hosts': split_list(args.host),
@@ -183,7 +196,8 @@ def job_payload(args, kind):
             'serves': [local_url(u) for u in split_list(getattr(args, 'serves', None))],
             'serves_caps': split_list(getattr(args, 'caps', None)),
             'notify': getattr(args, 'notify', None) or '',
-            'command': shlex.join(args.command) if getattr(args, 'command', None) else ''}
+            'command': shlex.join(args.command) if getattr(args, 'command', None) else '',
+            **({'expect_auto': True} if auto else {})}
 
 
 def say(msg):
@@ -199,6 +213,25 @@ def ago(now, then):
         return '-'
     s = int(now - then)
     return f'{s}s' if s < 90 else f'{s // 60}m' if s < 5400 else f'{s // 3600}h{(s % 3600) // 60:02d}m'
+
+
+def learned_fact(job):
+    """'expect ~12m (learned from 9 runs)' for a job whose expect the server guessed, else ''."""
+    if job.get('expect_source') == 'learned' and job.get('expect_learned_s'):
+        return f'expect ~{span(job["expect_learned_s"])} (learned from {job.get("expect_n", 0)} runs)'
+    return ''
+
+
+def explain_expect(job, args):
+    """Tell the user what the server decided about this job's duration, when it was not what they typed."""
+    if job.get('auto_refused'):
+        say(f'#{job["id"]} --expect auto refused: {job["auto_refused"]}')
+    if job.get('expect_source') == 'learned' and job.get('expect_learned_s'):
+        say(f'#{job["id"]} expect ~{span(job["expect_learned_s"])}, learned from {job.get("expect_n", 0)} similar '
+            'runs; pass --expect to set it')
+    elif job.get('expect_source') == 'given' and getattr(args, 'expect', None) == 'auto':
+        say(f'#{job["id"]} --expect auto: ~{span(job["expect_s"])} from {job.get("expect_n", 0)} similar runs, '
+            'now treated as given')
 
 
 def describe(job, now=None):
@@ -221,6 +254,8 @@ def describe(job, now=None):
         bits.append(f'reserved for {local_time(job["start_in_s"])}')
     if job.get('start_at') is not None and job.get('expect_s'):
         bits.append(f'booked for {span(job["expect_s"])}')
+    if learned_fact(job):
+        bits.append(learned_fact(job))
     if job['state'] == 'running':
         bits.append(f'for {ago(now, job["started_at"])}')
     if job['state'] == 'running' and job.get('deadline_in_s') is not None:
@@ -666,6 +701,7 @@ def cmd_run(client, args):
         raise
     if not booked_as_asked(client, args, payload, job):
         return 1
+    explain_expect(job, args)
     timeout_s = args.wait_timeout * 60 if args.wait_timeout else None
     try:
         started = wait_until_running(client, job, timeout_s, heartbeat=True, owner=args.owner)
@@ -736,6 +772,7 @@ def unwatch(client, job_id):
 def cmd_acquire(client, args):
     # With --wait this client heartbeats the queued lease; if it is killed, the server drops the lease.
     job = client.call('POST', '/v1/jobs', {**job_payload(args, 'lease'), 'watch': bool(args.wait)})
+    explain_expect(job, args)
     return hold(client, args, job)
 
 
@@ -822,6 +859,11 @@ def cmd_when(client, args):
         print(json.dumps(r, indent=2))
         return 0
     where = ', '.join(r['hosts'])
+    if r.get('auto_refused'):
+        print(f'--expect auto refused: {r["auto_refused"]}')
+    if r.get('expect_source') == 'learned':
+        print(f'assuming it runs ~{span(r["expect_s"])}, learned from {r.get("expect_n", 0)} similar runs '
+              '(pass --expect to set it)')
     if r['starts_now']:
         line = f'starts now on {where}'
         if r['deadline_in_s'] is not None:
@@ -834,7 +876,7 @@ def cmd_when(client, args):
         print(f'  estimated start: {local_time(r["start_in_s"])} (in {span(r["start_in_s"])}), '
               'if jobs ahead end when they expect to')
     else:
-        print('  no estimate: what holds it up has no expected end (a service down, a job without --expect, '
+        print('  no estimate: what holds it up has no expected end (a service down, a job without --expect or history to estimate from, '
               'load fleetq does not track)')
     return 0
 
@@ -987,6 +1029,9 @@ def render_stats(st):
     rows = [(k, d['n'], '-' if d['median_ratio'] is None else f'{d["median_ratio"]:.2f}',
              '-' if d['overdue_pct'] is None else f'{d["overdue_pct"]:.0f}%')
             for k, d in st['expect'].items()]
+    rows += [(f'{k} (learned)', d['n'], '-' if d['median_ratio'] is None else f'{d["median_ratio"]:.2f}',
+              '-' if d['overdue_pct'] is None else f'{d["overdue_pct"]:.0f}%')
+             for k, d in st.get('expect_learned', {}).items() if d['n']]
     out += ['', '--expect accuracy (finished jobs; ratio = actual / expected)',
             *table(('kind', 'n', 'median ratio', 'overdue'), rows)]
     if st['labels']:
@@ -1108,6 +1153,8 @@ def render_status(st, only_host=None, width=None, color=False):
             if j.get('serves'):
                 facts.append('serves ' + ', '.join(j['serves']))
             facts += load_facts(j)
+            if learned_fact(j):
+                facts.append(learned_fact(j))
             if j.get('deadline_in_s') is not None:
                 facts.append(f'must end within {span(max(j["deadline_in_s"], 0))}')
             lines += block(j['label'], lead)
@@ -1123,7 +1170,8 @@ def render_status(st, only_host=None, width=None, color=False):
                 continue
             shown[j['id']] = h['name']
             lines += block(j['label'], lead)
-            lines += block(f'{j["owner"]} · waits: {short(j["reason"])}', ' ' * len(lead), style='2')
+            note = f' · {learned_fact(j)}' if learned_fact(j) else ''
+            lines += block(f'{j["owner"]}{note} · waits: {short(j["reason"])}', ' ' * len(lead), style='2')
         if h.get('backfill') and h['backfill']['fits_s'] >= 60:
             b = h['backfill']
             what = 'reservation #' if b['reservation'] else '#'
@@ -1204,9 +1252,10 @@ def parser():
     p = sub.add_parser('run', help='wait for a slot, run a command, release when it exits')
     add_job_args(p)
     p.add_argument('--wait-timeout', type=float, help='minutes to wait in line before giving up')
-    p.add_argument('--expect', type=float,
+    p.add_argument('--expect', type=expect_arg,
                    help='expected minutes; lets it go ahead of a waiting job if it fits (it is then stopped '
-                        'at that job\'s start)')
+                        'at that job\'s start). Without it the server estimates from similar finished runs, '
+                        'which never sets a deadline; "auto" takes that estimate as your own (needs 5 similar runs)')
     add_start_args(p)
     p.add_argument('--no-queue', action='store_true', help='if the server is unreachable, run anyway')
     p.add_argument('--each', action='store_true',
@@ -1218,7 +1267,9 @@ def parser():
 
     p = sub.add_parser('acquire', help='take a slot for multi-step work; release it yourself')
     add_job_args(p)
-    p.add_argument('--expect', type=float, help='expected minutes (default 120); flagged overdue after')
+    p.add_argument('--expect', type=expect_arg,
+                   help='expected minutes (default: learned from similar runs, else 120); flagged overdue after. '
+                        '"auto": take the learned estimate as given (needs 5 similar runs)')
     p.add_argument('--wait', action='store_true', help='block until the slot is granted')
     p.add_argument('--wait-timeout', type=float, help='minutes to wait (with --wait)')
     p.add_argument('--json', action='store_true')
@@ -1249,10 +1300,12 @@ def parser():
     p.add_argument('--uses', action='append')
     p.add_argument('--takes-down', action='append', dest='takes_down')
     add_load_args(p)
-    p.add_argument('--expect', type=float, help='expected minutes')
+    p.add_argument('--expect', type=expect_arg, help='expected minutes, or auto')
     p.add_argument('--lease', action='store_true', help='as a lease (acquire) rather than a run job')
     p.add_argument('--json', action='store_true')
-    p.set_defaults(fn=cmd_when, label='when', note='')
+    p.add_argument('--label', default='when', help='name the job would have; its first word picks the history '
+                                                   'an estimate is learned from')
+    p.set_defaults(fn=cmd_when, note='')
 
     p = sub.add_parser('wait', help='block until a queued job is running')
     p.add_argument('id', type=int)

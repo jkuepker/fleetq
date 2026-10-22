@@ -20,10 +20,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   note TEXT NOT NULL DEFAULT '', mem_map TEXT NOT NULL DEFAULT '{}',
   serves TEXT NOT NULL DEFAULT '[]', serves_caps TEXT NOT NULL DEFAULT '[]',
   watch INTEGER NOT NULL DEFAULT 0, seen_at REAL,
-  load TEXT NOT NULL DEFAULT '["gpu"]', quiet TEXT NOT NULL DEFAULT '[]', start_at REAL, deadline REAL, notify TEXT NOT NULL DEFAULT '');
+  load TEXT NOT NULL DEFAULT '["gpu"]', quiet TEXT NOT NULL DEFAULT '[]', start_at REAL, deadline REAL, notify TEXT NOT NULL DEFAULT '',
+  expect_source TEXT NOT NULL DEFAULT '', expect_n INTEGER NOT NULL DEFAULT 0, expect_learned_s REAL);
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
 CREATE INDEX IF NOT EXISTS jobs_ended ON jobs(ended_at);
+CREATE INDEX IF NOT EXISTS jobs_kind_state_ended ON jobs(kind, state, ended_at);
 CREATE TABLE IF NOT EXISTS restores (
   service TEXT PRIMARY KEY, job_id INTEGER NOT NULL, owner TEXT NOT NULL, label TEXT NOT NULL,
   since REAL NOT NULL);
@@ -32,16 +34,22 @@ CREATE TABLE IF NOT EXISTS events (
   kind TEXT NOT NULL, text TEXT NOT NULL);
 """
 
+FINISHED_SQL = ("SELECT label, owner, hosts, started_at, ended_at FROM jobs WHERE kind = ? AND state = 'done' "
+                'AND ended_at >= ? AND started_at IS NOT NULL AND (exit_code IS NULL OR exit_code = 0)')
 JOB_FIELDS = {f.name for f in fields(Job)}
 STATS_COLUMNS = ('id', 'state', 'kind', 'owner', 'label', 'hosts', 'created_at', 'started_at', 'ended_at',
-                 'expect_s', 'reason', 'start_at', 'deadline')
+                 'expect_s', 'reason', 'start_at', 'deadline', 'expect_source', 'expect_learned_s')
 JSON_FIELDS = ('hosts', 'uses', 'takes_down', 'mem_map', 'serves', 'serves_caps', 'load', 'quiet')
 ADDED_COLUMNS = {'mem_map': "TEXT NOT NULL DEFAULT '{}'", 'serves': "TEXT NOT NULL DEFAULT '[]'",
                  'serves_caps': "TEXT NOT NULL DEFAULT '[]'", 'watch': 'INTEGER NOT NULL DEFAULT 0',
                  'seen_at': 'REAL',
                  # Jobs from before --load loaded the GPU, as every job does unless it says otherwise.
                  'load': """TEXT NOT NULL DEFAULT '["gpu"]'""", 'quiet': "TEXT NOT NULL DEFAULT '[]'",
-                 'start_at': 'REAL', 'deadline': 'REAL', 'notify': "TEXT NOT NULL DEFAULT ''"}
+                 'start_at': 'REAL', 'deadline': 'REAL', 'notify': "TEXT NOT NULL DEFAULT ''",
+                 # Older rows have no source: Job derives it (given if expect_s is set, else default).
+                 'expect_source': "TEXT NOT NULL DEFAULT ''", 'expect_n': 'INTEGER NOT NULL DEFAULT 0',
+                 # The server's learned estimate; expect_s never holds one (an older server would take it as stated).
+                 'expect_learned_s': 'REAL'}
 
 
 class Store:
@@ -99,12 +107,13 @@ class Store:
         cur = self.db.execute(
             'INSERT INTO jobs (state, kind, owner, label, hosts, mem_gb, exclusive, uses, takes_down, '
             'created_at, heartbeat_at, expect_s, command, note, mem_map, serves, serves_caps, watch, seen_at, '
-            'load, quiet, start_at, deadline, notify) VALUES (' + ','.join('?' * 24) + ')',
+            'load, quiet, start_at, deadline, notify, expect_source, expect_n, expect_learned_s) VALUES (' + ','.join('?' * 27) + ')',
             (job.state, job.kind, job.owner, job.label, json.dumps(job.hosts), job.mem_gb,
              int(job.exclusive), json.dumps(job.uses), json.dumps(job.takes_down), job.created_at,
              job.heartbeat_at, job.expect_s, job.command, job.note, json.dumps(job.mem_map),
              json.dumps(job.serves), json.dumps(job.serves_caps), int(job.watch), job.seen_at,
-             json.dumps(job.load), json.dumps(job.quiet), job.start_at, job.deadline, job.notify))
+             json.dumps(job.load), json.dumps(job.quiet), job.start_at, job.deadline, job.notify,
+             job.expect_source, job.expect_n, job.expect_learned_s))
         job.id = cur.lastrowid
         return job
 
@@ -145,6 +154,12 @@ class Store:
             d['hosts'] = json.loads(d['hosts'])
             out.append(d)
         return out
+
+    def finished_rows(self, kind, since):
+        """Jobs of one kind that ran to completion (done, not cancelled, exit 0 or no exit code) and
+        ended since `since`, for learn.index. Uses jobs_kind_state_ended."""
+        rows = self.db.execute(FINISHED_SQL, (kind, since))
+        return [{**dict(r), 'hosts': json.loads(r['hosts'])} for r in rows]
 
     def restores(self):
         return {r['service']: Restore(**dict(r)) for r in self.db.execute('SELECT * FROM restores')}

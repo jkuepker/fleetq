@@ -29,6 +29,13 @@ restore_grace_s = 600
 # Events older than this many days are dropped, at most once a day (0 keeps everything).
 events_keep_days = 180
 default_expect_min = 120
+# Jobs without --expect get an estimate learned from finished jobs of the same kind and label
+# prefix: this quantile of their durations times the factor, from the last learn_days days,
+# when at least learn_min_samples exist (learn_days = 0: off). Learned estimates never set deadlines.
+learn_days = 30
+learn_min_samples = 3
+learn_quantile = 0.8
+learn_factor = 1.25
 # Jobs may name their own notify URL (fleetq run/acquire/reserve --notify URL). That makes the
 # server POST to a URL a client chose, so it is off unless you turn it on, and then limited to
 # these hosts (globs allowed). The [[notify]] entries below are not restricted.
