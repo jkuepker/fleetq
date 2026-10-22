@@ -206,6 +206,8 @@ check is back).
 - **Coding agents**: a pre-tool hook (e.g. Claude Code's `PreToolUse`) can deny shell
   commands that start, stop or load work on a fleet box unless they run via `fleetq run` or
   with a covering `FLEETQ_JOB`. Give each agent session its own owner name.
+  [`examples/claude-code/`](examples/claude-code/) is a ready-made hook that reads the boxes
+  from `fleetq roster`.
 - **Agent harnesses** pick a model with `GET /v1/models` and hold a shared lease (`--uses`)
   on the service they send requests to, so nobody takes it down mid-run.
 - **Dashboards and status bars** read `GET /v1/status` with the read-only token.
