@@ -30,6 +30,7 @@ DEFAULTS = {'listen': '0.0.0.0', 'port': 8470, 'token_file': '/etc/fleetq/token'
 MAX_STATS_DAYS = 3650
 MAX_WAIT_S = 30  # longest a GET /v1/jobs/<id>?wait=N holds the request open
 LEARN_CACHE_S = 300  # how long finished-job history is reused between submits
+RELEARN_S = 300      # how often the estimates of jobs still waiting in line are refreshed (see relearn_queued)
 
 
 def load_config(path):
@@ -91,6 +92,7 @@ class Fleet:
         self.last_prune = None
         self.stepped_at = None    # server clock at the last scheduling pass
         self.learned = {}         # job kind -> (read at, learn.index of its finished jobs)
+        self.relearned_at = None  # server clock at the last relearn_queued pass
         self.collectors = {}
         for name, h in self.host_cfg.items():
             token_file = h.get('collector_token_file')
@@ -200,6 +202,10 @@ class Fleet:
     def step(self):
         """Clear confirmed restores, drop abandoned waiters, start whatever may start, flag unclaimed leases."""
         now = self.clock()
+        try:
+            self.relearn_queued(now)
+        except Exception as exc:  # a better guess is never worth a failed scheduling pass
+            sys.stderr.write(f'relearn of queued jobs failed: {exc!r}\n')
         for name, rest in self.store.restores().items():
             if core.restored(self.obs.get(name), rest):
                 self.store.clear_restore(name)
@@ -250,6 +256,28 @@ class Fleet:
         with self.changed:
             self.version += 1
             self.changed.notify_all()
+
+    def relearn_queued(self, now):
+        """Re-estimate queued jobs that have no stated --expect, at most every RELEARN_S: a job queued
+        before there was history for its label (or before learning existed) can then backfill. Only
+        source default or learned is touched, never a given one or a running job, whose estimate is fixed
+        at its start. The estimate goes in expect_learned_s, expect_n and expect_source only; expect_s is
+        never written, so an older server still reads these jobs as having no --expect. Runs inside step()'s
+        lock and transaction, on the same history cache as submit, and writes only the jobs that changed.
+        Returns how many did."""
+        if self.relearned_at is not None and 0 <= now - self.relearned_at < RELEARN_S:
+            return 0
+        self.relearned_at = now
+        changed = 0
+        for job in self.store.active_jobs():
+            if job.state != QUEUED or job.expect_source not in (core.DEFAULT, core.LEARNED):
+                continue
+            guess = self.learned_expect(job.kind, job.label, job.owner, job.hosts, now)
+            source, seconds = (core.LEARNED, guess.seconds) if guess.source == core.LEARNED else (core.DEFAULT, None)
+            if (source, seconds, guess.n) != (job.expect_source, job.expect_learned_s, job.expect_n):
+                self.store.update_job(job.id, expect_source=source, expect_learned_s=seconds, expect_n=guess.n)
+                changed += 1
+        return changed
 
     def _flag_events(self, now, restores, statuses):
         """Events for states that otherwise only show as a flag, once per time the state begins. What

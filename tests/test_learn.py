@@ -440,3 +440,173 @@ def test_the_history_query_uses_the_kind_state_ended_index(env):
     plan_rows = fleet.store.db.execute('EXPLAIN QUERY PLAN ' + store.FINISHED_SQL, ('run', 0)).fetchall()
     detail = ' '.join(r['detail'] for r in plan_rows)
     assert 'jobs_kind_state_ended' in detail and 'SEARCH' in detail, detail
+
+
+# ---- refreshing the estimate of jobs already waiting ---------------------------------------
+
+def relearn(fleet):
+    """One refresh pass as step() runs it, but with no scheduling pass after it."""
+    fleet.relearned_at = None
+    with fleet.lock, fleet.store.transaction():
+        return fleet.relearn_queued(fleet.clock())
+
+
+def pass_time(fleet, clock, seconds, *ids):
+    """Let time go by in 100 s steps with the clients of ids still heartbeating, as `fleetq wait` does."""
+    while seconds > 0:
+        clock.t += min(seconds, 100)
+        seconds -= 100
+        for i in ids:
+            fleet.heartbeat(i)
+
+
+def stored(fleet, job_id):
+    return dict(fleet.store.db.execute('SELECT * FROM jobs WHERE id = ?', (job_id,)).fetchone())
+
+
+def add(fleet, state='queued', kind='run', label='train-91', **kw):
+    with fleet.lock, fleet.store.transaction():
+        return fleet.store.add_job(core.Job(0, state, kind, 'me', label, ['a'], created_at=fleet.clock(),
+                                            started_at=fleet.clock() if state == 'running' else None, **kw)).id
+
+
+def book_a(fleet, start_in_s=3600):
+    """An exclusive hour on host a, start_in_s from now: a job only fits ahead of it if it is short."""
+    return fleet.submit({'label': 'big', 'owner': 'x', 'hosts': ['a'], 'exclusive': True,
+                         'start_in_s': start_in_s, 'expect_min': 60})
+
+
+def test_a_queued_default_job_is_learned_once_history_appears_and_then_backfills(env, capsys):
+    fleet, clock, url = env
+    book_a(fleet)
+    j = fleet.submit({'label': 'train-1', 'owner': 'me', 'hosts': ['a'], 'kind': 'run'})
+    assert (j['state'], j['expect_source']) == ('queued', 'default')     # no history yet: the 2 h default
+    assert 'would still be running when reservation' in j['reason']
+    history(fleet, clock, 'train', 4, took_s=20, hosts=('b',))          # 4 short runs, elsewhere
+    fleet.heartbeat(j['id'])
+    fleet.tick()
+    assert fleet.get(j['id'])['expect_source'] == 'default'              # inside the five minutes: not looked at
+    pass_time(fleet, clock, 301, j['id'])
+    fleet.tick()
+    j = fleet.get(j['id'])
+    assert (j['expect_source'], j['expect_n'], j['expect_learned_s']) == ('learned', 4, learn.FLOOR_S)
+    assert j['state'] == 'running' and j['deadline'] is None             # 2 min x 1.5 x 1.2 + 5 min fits in the hour
+    capsys.readouterr()
+    assert cli.main(['show', str(j['id'])]) == 0
+    assert 'expect ~2m (learned from 4 runs)' in capsys.readouterr().out                   # shown as any learned job is
+
+
+def test_a_learned_job_that_does_not_fit_stays_queued(env):
+    fleet, clock, url = env
+    book_a(fleet, start_in_s=600)
+    j = fleet.submit({'label': 'train-1', 'owner': 'me', 'hosts': ['a'], 'kind': 'run'})
+    history(fleet, clock, 'train', 4, took_s=20, hosts=('b',))
+    fleet.heartbeat(j['id'])
+    pass_time(fleet, clock, 301, j['id'])
+    fleet.tick()
+    j = fleet.get(j['id'])
+    assert j['expect_source'] == 'learned' and j['state'] == 'queued'    # 8.6 min > the 5 left: still waits
+    assert 'would still be running when reservation' in j['reason']
+
+
+def test_refresh_touches_only_queued_default_or_learned_jobs(env):
+    fleet, clock, url = env
+    history(fleet, clock, 'train', 5)                                    # runs: 600 s each
+    history(fleet, clock, 'train', 3, kind='lease')
+    clock.t += 301
+    queued = add(fleet)
+    queued_lease = add(fleet, kind='lease', label='train-92', expect_s=7200.0, expect_source='default')
+    stale = add(fleet, label='train-93', expect_source='learned', expect_learned_s=99.0, expect_n=1)
+    given = add(fleet, label='train-94', expect_s=1200.0)
+    running = add(fleet, 'running', label='train-95')
+    running_learned = add(fleet, 'running', label='train-96', expect_source='learned', expect_learned_s=99.0,
+                          expect_n=1)
+    before = {i: stored(fleet, i) for i in (given, running, running_learned)}
+    assert relearn(fleet) == 3
+    for i in (queued, stale):
+        s = stored(fleet, i)
+        assert (s['expect_source'], s['expect_n'], s['expect_learned_s'], s['expect_s']) == ('learned', 5, 750.0, None)
+    s = stored(fleet, queued_lease)
+    assert (s['expect_source'], s['expect_n'], s['expect_learned_s'], s['expect_s']) == ('learned', 3, 750.0, 7200.0)
+    assert {i: stored(fleet, i) for i in before} == before               # given and running: not one column changed
+    assert stored(fleet, given)['expect_s'] == 1200.0 and stored(fleet, given)['expect_source'] == 'given'
+
+
+def test_refresh_never_writes_expect_s_so_a_rollback_reads_these_jobs_as_having_none(env):
+    fleet, clock, url = env
+    history(fleet, clock, 'train', 5)
+    history(fleet, clock, 'train', 3, kind='lease')
+    clock.t += 301
+    run, lease = add(fleet), add(fleet, kind='lease', label='train-92', expect_s=7200.0, expect_source='default')
+    assert relearn(fleet) == 2
+    assert stored(fleet, run)['expect_s'] is None and stored(fleet, lease)['expect_s'] == 7200.0
+    old = old_scheduler_view({**stored(fleet, run), 'hosts': ['a'], 'uses': [], 'takes_down': [], 'mem_map': {},
+                              'serves': [], 'serves_caps': [], 'load': ['gpu'], 'quiet': [], 'exclusive': False,
+                              'watch': False})
+    assert old.expect_s is None and old.overdue_after() is None          # an older server: no --expect at all
+    assert core.Job(**{**old.__dict__, 'expect_source': 'learned', 'expect_learned_s': 750.0}).learned()
+    assert fleet.get(run)['expect_source'] == 'learned'                  # ...and this one shows it
+
+
+def test_refresh_follows_the_history_and_falls_back_to_default_when_it_goes(env):
+    fleet, clock, url = env
+    add(fleet, 'running', kind='lease', label='hold-91', exclusive=True, expect_s=7200.0, expect_source='given')
+    history(fleet, clock, 'train', 4, hosts=('b',))                      # a is held, so j below stays queued
+    clock.t += 301
+    j = add(fleet)
+    assert relearn(fleet) == 1 and stored(fleet, j)['expect_learned_s'] == 750.0
+    assert relearn(fleet) == 0                                           # nothing new: nothing written
+    history(fleet, clock, 'train', 4, took_s=1200, hosts=('b',))         # longer runs now: the estimate follows
+    clock.t += 301
+    relearn(fleet)
+    assert stored(fleet, j)['expect_learned_s'] > 750.0 and stored(fleet, j)['expect_n'] == 8
+    fleet.cfg['learn_days'] = 0                                          # turned off: as a new job would be
+    assert relearn(fleet) == 1
+    s = stored(fleet, j)
+    assert (s['expect_source'], s['expect_learned_s'], s['expect_n'], s['expect_s']) == ('default', None, 0, None)
+
+
+def test_refresh_is_bounded_to_once_per_five_minutes_and_reads_history_once_per_kind(env, monkeypatch):
+    fleet, clock, url = env
+    book_a(fleet)
+    j = fleet.submit({'label': 'train-1', 'owner': 'me', 'hosts': ['a'], 'kind': 'run'})
+    assert j['state'] == 'queued'
+    asked, reads = [], []
+    original, read = fleet.learned_expect, fleet.store.finished_rows
+    monkeypatch.setattr(fleet, 'learned_expect', lambda *a: asked.append(a) or original(*a))
+    monkeypatch.setattr(fleet.store, 'finished_rows', lambda *a: reads.append(a) or read(*a))
+    passes = 0
+    for _ in range(71):                                                  # a pass every 10 s for 700 s
+        fleet.heartbeat(j['id'])
+        fleet.tick()
+        clock.t += 10
+        passes += 2
+    assert passes == 142 and len(asked) == 2                             # at 300 and 600 s (the submit was the 0): one look per window
+    assert len(reads) <= len(asked)                                      # and never more history reads than looks
+    asked.clear()
+    clock.t -= 3600                                                      # a clock that jumped back is not "too soon"
+    fleet.tick()
+    assert len(asked) == 1
+
+
+def test_a_pass_with_no_queued_default_jobs_reads_no_history(env, monkeypatch):
+    fleet, clock, url = env
+    fleet.submit({'label': 'hold', 'owner': 'me', 'hosts': ['a'], 'expect_min': 60})
+    fleet.submit({'label': 'train-94', 'owner': 'me', 'hosts': ['a'], 'kind': 'run', 'expect_min': 20})
+    reads = []
+    read = fleet.store.finished_rows
+    monkeypatch.setattr(fleet.store, 'finished_rows', lambda *a: reads.append(a) or read(*a))
+    clock.t += 301
+    assert relearn(fleet) == 0 and reads == []
+
+
+def test_a_failing_refresh_never_stops_the_scheduling_pass(env, capsys):
+    fleet, clock, url = env
+    add(fleet)                                                           # a queued job with no --expect: a refresh candidate
+    def boom(*a, **kw):
+        raise RuntimeError('history unreadable')
+    fleet.learned_expect = boom
+    fleet.relearned_at = None
+    j = fleet.submit({'label': 'plain-1', 'owner': 'me', 'hosts': ['b'], 'kind': 'run', 'expect_min': 5})
+    assert j['state'] == 'running'                                       # the pass still ran and started it
+    assert 'relearn of queued jobs failed' in capsys.readouterr().err
