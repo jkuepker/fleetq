@@ -9,8 +9,8 @@ NOW = 1000.0
 def roster(cap=100, svc_mem=40):
     hosts = {'a': Host('a', 'ma', cap, ['alpha']), 'b': Host('b', 'mb', cap),
              't1': Host('t1', 'tat', 12), 't2': Host('t2', 'tat', 32)}
-    services = [Service('a-llm', 'a', svc_mem, url='http://a/v1', models=['m'], roles=['flight', 'guidance']),
-                Service('b-llm', 'b', 0, url='http://b/v1', models=['m'], roles=['retro']),
+    services = [Service('a-llm', 'a', svc_mem, url='http://a/v1', models=['m'], roles=['chat-a', 'reason-a']),
+                Service('b-llm', 'b', 0, url='http://b/v1', models=['m'], roles=['embed-a']),
                 Service('a-side', 'a', 0, kind='standing')]
     return hosts, services
 
@@ -219,12 +219,14 @@ def test_multi_host_jobs_keep_global_order_without_deadlock():
     w = World()
     blocker = job(1, RUNNING, hosts=['b'], exclusive=True)
     both = job(2, hosts=['a', 'b'], mem_gb=10)
-    only_a = job(3, hosts=['a'])
+    only_a = job(3, hosts=['a'], mem_gb=55)  # 60 free on a: would leave #2 too little
     start, why = w.plan([blocker, both, only_a])
     assert start == [] and 'held exclusively by #1' in why[2]
     assert why[3] == 'in line behind #2 "j2" (o) on a'
     blocker.state = core.DONE
-    assert w.plan([blocker, both, only_a])[0] == [2, 3]
+    assert w.plan([blocker, both, only_a])[0] == [2]
+    small = job(4, hosts=['a'], mem_gb=5)  # holds nobody up: goes ahead of #2
+    assert w.plan([job(1, RUNNING, hosts=['b'], exclusive=True), both, small])[0] == [4]
 
 
 def test_optional_service_memory_counts_only_while_it_answers():
@@ -245,7 +247,7 @@ def test_wrong_model_is_flagged_and_unusable():
 
 def test_name_resolution():
     hosts, services = roster()
-    assert core.resolve_names(['guidance', 'retro', 'a-llm'], services, 'role') == ['a-llm', 'b-llm']
+    assert core.resolve_names(['reason-a', 'embed-a', 'a-llm'], services, 'role') == ['a-llm', 'b-llm']
     assert core.resolve_hosts(['alpha', 'tat'], hosts) == ['a', 't1', 't2']
     with pytest.raises(ValueError, match='unknown role "nope"'):
         core.resolve_names(['nope'], services, 'role')
@@ -263,15 +265,15 @@ def test_busy_gpu_with_no_fleetq_job_blocks_exclusive_jobs_only():
 
 
 def test_resolve_url_places_work_by_service_port_then_default_pool():
-    hosts = {'s1': Host('s1', 'spark-4e77', 116, ['spark1'], addresses=['192.0.2.11', '100.64.0.11']),
-             'b580': Host('b580', 'tatooine', 12, addresses=['100.64.0.30']),
-             'r9700': Host('r9700', 'tatooine', 32, addresses=['100.64.0.30'], default=True)}
-    services = [Service('s1-vllm', 's1', 70, url='http://spark-4e77:8000/v1'),
-                Service('eecom-chat', 'b580', 9, url='http://tatooine:8010/v1')]
+    hosts = {'s1': Host('s1', 'gpu-a', 116, ['gpu-a'], addresses=['192.0.2.11', '100.64.0.11']),
+             'gpu-c1': Host('gpu-c1', 'gpu-c', 12, addresses=['100.64.0.30']),
+             'gpu-c0': Host('gpu-c0', 'gpu-c', 32, addresses=['100.64.0.30'], default=True)}
+    services = [Service('s1-vllm', 's1', 70, url='http://gpu-a:8000/v1'),
+                Service('chat-small', 'gpu-c1', 9, url='http://gpu-c:8010/v1')]
     assert core.resolve_url('http://100.64.0.11:8000/v1', hosts, services) == (['s1'], 's1-vllm')
-    assert core.resolve_url('http://spark-4e77.tail1234.ts.net:9999/v1', hosts, services) == (['s1'], None)
-    assert core.resolve_url('http://tatooine:8010/v1', hosts, services) == (['b580'], 'eecom-chat')
-    assert core.resolve_url('http://tatooine:8095/v1', hosts, services) == (['r9700'], None)
+    assert core.resolve_url('http://gpu-a.tailnet.example:9999/v1', hosts, services) == (['s1'], None)
+    assert core.resolve_url('http://gpu-c:8010/v1', hosts, services) == (['gpu-c1'], 'chat-small')
+    assert core.resolve_url('http://gpu-c:8095/v1', hosts, services) == (['gpu-c0'], None)
     assert core.resolve_url('http://api.example.com/v1', hosts, services) == ([], None)
 
 
@@ -301,7 +303,7 @@ def test_models_lists_each_usable_url_and_model_with_declared_capabilities():
     a, b = got[('http://a/v1', 'm')], got[('http://b/v1', 'm')]
     assert (a['capabilities'], a['capabilities_source'], a['context'], a['root']) == (['text', 'image'], 'config', 32768, 'org/M')
     assert (b['capabilities'], b['capabilities_source'], b['context']) == ([], 'unknown', None)
-    assert a['usable'] and a['verified'] and a['roles'] == ['flight', 'guidance'] and a['age_s'] == 5
+    assert a['usable'] and a['verified'] and a['roles'] == ['chat-a', 'reason-a'] and a['age_s'] == 5
 
 
 def test_per_model_capabilities_override_the_service_list():
@@ -325,8 +327,8 @@ def test_models_skips_held_and_wedged_services_unless_asked_for_all():
 def test_two_ranks_behind_one_url_make_one_entry():
     w = World()
     w.hosts['t1'], w.hosts['t2'] = Host('t1', 'tat', 32), Host('t2', 'tat', 32)
-    w.services += [Service('r0', 't1', url='http://tat:8080/v1', roles=['radiance']),
-                   Service('r1', 't2', url='http://tat:8080/v1/', roles=['radiance'])]
+    w.services += [Service('r0', 't1', url='http://tat:8080/v1', roles=['native']),
+                   Service('r1', 't2', url='http://tat:8080/v1/', roles=['native'])]
     w.obs['r0'] = w.obs['r1'] = Observation('up', ['qwen'], 0, at=NOW)
     rad = [e for e in entries(w) if e['model'] == 'qwen']
     assert len(rad) == 1 and rad[0]['services'] == ['r0', 'r1'] and rad[0]['hosts'] == ['t1', 't2']
@@ -351,3 +353,151 @@ def test_job_served_models_appear_once_seen_and_only_while_running():
         ('new', ['text', 'video'], 'job', 8192, 7)
     j.state = 'done'
     assert [e for e in entries(w, [j], seen, include_all=True) if e['job']] == []
+
+
+# ---- loads, backfill, reservations ---------------------------------------------------------
+
+def test_download_and_benchmark_coexist_but_a_gpu_job_waits_for_the_benchmark():
+    w = World()
+    download = job(1, RUNNING, load=['net', 'disk'], expect_s=7200, started_at=NOW)
+    bench = job(2, quiet=['gpu', 'cpu'])
+    start, _ = w.plan([download, bench])
+    assert start == [2]
+    bench.state, bench.started_at = RUNNING, NOW
+    small = job(3, mem_gb=5)  # loads the GPU, the default
+    start, why = w.plan([download, bench, small])
+    assert start == [] and why[3] == '#2 "j2" (o) needs gpu quiet on a, and this job loads it'
+    # The other way round: the benchmark waits for a GPU job that is already running.
+    gpu = job(4, RUNNING, started_at=NOW)
+    start, why = w.plan([gpu, job(5, quiet=['gpu'])])
+    assert start == [] and why[5] == 'needs gpu quiet on a, but #4 "j4" (o) loads it'
+
+
+def test_using_a_service_counts_as_gpu_load():
+    w = World()
+    harness = job(1, RUNNING, load=['net'], uses=['a-llm'])
+    start, why = w.plan([harness, job(2, quiet=['gpu'])])
+    assert start == [] and 'needs gpu quiet on a, but #1' in why[2]
+
+
+def test_quiet_gpu_checks_untracked_load_like_exclusive():
+    w = World()
+    w.obs['a-llm'] = Observation('up', ['m'], 2, at=NOW - 5)
+    net = job(1, RUNNING, load=['net'])
+    start, why = w.plan([net, job(2, quiet=['gpu'])])
+    assert start == [] and 'requests not tracked by fleetq are in flight' in why[2]
+    w.obs['a-llm'] = Observation('up', ['m'], 0, at=NOW - 5)
+    start, why = core.schedule([net, job(2, quiet=['gpu'])], w.hosts, w.services, w.statuses([net]), w.obs,
+                               w.online, {}, {'a': 0.9}, now=NOW)
+    assert start == [] and 'GPU is 90% busy' in why[2]
+    # Without --quiet gpu, the busy GPU does not matter.
+    start, _ = core.schedule([net, job(3, load=['cpu'])], w.hosts, w.services, w.statuses([net]), w.obs,
+                             w.online, {}, {'a': 0.9}, now=NOW)
+    assert start == [3]
+
+
+def backfill_world():
+    """#1 runs on a for another hour; #2 needs the GPU quiet and waits for it."""
+    w = World()
+    running = job(1, RUNNING, expect_s=3600, started_at=NOW)
+    head = job(2, quiet=['gpu'])
+    return w, running, head
+
+
+def test_backfill_admits_a_short_run_job_with_a_deadline_and_refuses_one_without_expect():
+    w, running, head = backfill_world()
+    short = job(3, kind='run', expect_s=20 * 60)     # 20 min * 1.2 + 5 min = 29 min <= 60
+    long = job(4, kind='run', expect_s=50 * 60)      # 65 min > 60
+    blind = job(5, kind='run')                       # no --expect
+    lease = job(6, expect_s=10 * 60)                 # leases never take the deadline route
+    p = core.plan([running, head, short, long, blind, lease], w.hosts, w.services,
+                  w.statuses([running]), w.obs, w.online, {}, now=NOW)
+    assert p.to_start == [3]
+    assert p.deadlines == {3: NOW + 3600}
+    assert p.starts[2] == NOW + 3600 and p.line == [2, 4, 5, 6]
+    assert p.reasons[4] == 'in line behind #2 "j2" (o) on a'
+    assert p.reasons[5] == 'in line behind #2 "j2" (o) on a; with --expect it may go first if it ends before #2 starts'
+    assert p.reasons[6] == 'in line behind #2 "j2" (o) on a'
+
+
+def test_backfill_needs_a_known_start_and_lets_harmless_jobs_through():
+    w, running, head = backfill_world()
+    running.expect_s = None  # nobody knows when #1 ends
+    short = job(3, kind='run', expect_s=60)
+    quiet_one = job(4, load=['net'])  # does not load the GPU: cannot hold #2 up
+    p = core.plan([running, head, short, quiet_one], w.hosts, w.services, w.statuses([running]), w.obs,
+                  w.online, {}, now=NOW)
+    assert p.starts[2] is None and p.to_start == [4] and p.deadlines == {}
+
+
+def test_backfill_respects_memory_the_head_will_need():
+    w = World()  # 60 GB free for jobs on a
+    running = job(1, RUNNING, mem_gb=50, expect_s=3600, started_at=NOW)
+    head = job(2, mem_gb=40)  # needs #1 gone
+    fits = job(3, mem_gb=10)  # 10 + 40 <= 60 once #1 is gone: no harm
+    hogs = job(4, mem_gb=10)  # now 20 + 40 > 60: would hold #2 up
+    p = core.plan([running, head, fits, hogs], w.hosts, w.services, w.statuses([running]), w.obs,
+                  w.online, {}, now=NOW)
+    assert p.to_start == [3] and p.reasons[4].startswith('in line behind #2')
+
+
+def test_reservation_waits_for_its_time_then_goes_first_in_line():
+    w = World()
+    early = job(1, mem_gb=50)
+    booked = job(2, mem_gb=50, start_at=NOW + 600, expect_s=3600)
+    p = core.plan([booked, early], w.hosts, w.services, w.statuses([]), w.obs, w.online, {}, now=NOW)
+    # #1 expects the default 2 h, which would run into the reservation's start.
+    assert p.to_start == [] and p.reasons[1] == 'would still be running when reservation #2 "j2" (o) starts'
+    assert p.reasons[2] == 'reserved; waits for its start time' and p.starts[2] == NOW + 600
+    early.expect_s = 5 * 60
+    assert core.schedule([booked, early], w.hosts, w.services, w.statuses([]), w.obs, w.online, {},
+                         now=NOW)[0] == [1]
+    # Once due it is first in line, ahead of an older queued job.
+    late = NOW + 601
+    p = core.plan([job(3, mem_gb=50), booked], w.hosts, w.services, w.statuses([]), w.obs, w.online, {}, now=late)
+    assert p.to_start == [2] and p.reasons[3] == 'needs 50 GB on a; 10 GB free of 100'
+
+
+def test_run_job_before_a_reservation_gets_its_start_as_deadline():
+    w = World()
+    booked = job(1, exclusive=True, start_at=NOW + 3600, expect_s=3600)
+    quick = job(2, kind='run', expect_s=30 * 60)
+    p = core.plan([booked, quick], w.hosts, w.services, w.statuses([]), w.obs, w.online, {}, now=NOW)
+    assert p.to_start == [2] and p.deadlines[2] == NOW + 3600
+
+
+def test_reservation_windows_clash_only_when_they_overlap_and_collide():
+    w = World()
+    a = job(1, quiet=['gpu', 'cpu'], start_at=NOW + 3600, expect_s=3600)
+    windows = core.booked_windows([a], NOW)
+    st = w.statuses([])
+    gpu = job(0, mem_gb=5)
+    hit = core.window_clash(gpu, NOW + 5400, 3600, windows, w.hosts, w.services, st)
+    assert hit and hit[0] == [a] and hit[1] == '#1 "j1" (o) needs gpu quiet on a, and this job loads it'
+    assert core.window_clash(gpu, NOW + 7200, 3600, windows, w.hosts, w.services, st) is None
+    assert core.window_clash(job(0, load=['net']), NOW + 5400, 3600, windows, w.hosts, w.services, st) is None
+    assert core.window_clash(job(0, hosts=['b']), NOW + 5400, 3600, windows, w.hosts, w.services, st) is None
+    free = core.free_windows(gpu, 3600, windows, w.hosts, w.services, st, NOW)
+    assert free[0] == (NOW, NOW + 3600) and free[1] == (NOW + 7200, None)
+    # Memory adds up across every reservation present at once.
+    big = [job(2, mem_gb=30, start_at=NOW, expect_s=3600), job(3, mem_gb=20, start_at=NOW + 600, expect_s=3600)]
+    hit = core.window_clash(job(0, mem_gb=15, load=[]), NOW + 1200, 600, core.booked_windows(big, NOW),
+                            w.hosts, w.services, st)
+    assert hit and 'needs 15 GB on a; 10 GB free' in hit[1]
+
+
+def test_forecast_estimates_the_start_from_expected_ends():
+    w = World()
+    running = job(1, RUNNING, exclusive=True, expect_s=3600, started_at=NOW - 600)
+    ahead = job(2, exclusive=True, expect_s=1800)
+    me = job(3, mem_gb=10)
+
+    def statuses_for(run, t):
+        return core.all_statuses(w.services, w.obs, run, {}, w.online, t, 600)
+    start, deadline = core.forecast([running, ahead, me], 3, w.hosts, w.services, statuses_for, w.obs,
+                                    w.online, {}, {}, NOW)
+    assert start == NOW + 3000 + 1800 and deadline is None
+    # A down service it needs has no expected end: no estimate.
+    w.obs['a-llm'] = Observation('down', at=NOW)
+    needs = job(4, uses=['a-llm'])
+    assert core.forecast([needs], 4, w.hosts, w.services, statuses_for, w.obs, w.online, {}, {}, NOW) == (None, None)
