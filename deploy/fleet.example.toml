@@ -19,6 +19,9 @@ token_file = "/etc/fleetq/token"
 readonly_token_file = "/etc/fleetq/readonly_token"
 db = "/var/lib/fleetq/fleetq.db"
 probe_interval_s = 30
+# Between full checks: how often to re-check just a service restoring after a takedown
+# and the --serves URLs of running jobs that are still starting (0 = off).
+fast_probe_s = 5
 stale_heartbeat_s = 180
 restore_grace_s = 600
 default_expect_min = 120

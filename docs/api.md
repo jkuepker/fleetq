@@ -24,7 +24,28 @@ Errors are `{"error": "<message>"}` with a 4xx status.
 | `GET /v1/models[?cap=image,text][&all=1]` | models that can take requests now, one per `(url, model)` |
 | `GET /v1/roster` | the configured hosts and services, as loaded from the roster |
 | `GET /v1/events[?limit=30]` | the most recent log lines (1 to 500) |
-| `GET /v1/jobs/<id>` | one job; queued jobs also carry `position` |
+| `GET /v1/jobs/<id>[?wait=N[&state=queued]]` | one job; queued jobs also carry `position`. With `wait`, a long-poll (below) |
+
+### Long-poll: `GET /v1/jobs/<id>?wait=N`
+
+Holds the request open for up to `N` seconds (capped at 30) and answers as soon as the
+job's `state` or `reason` changes, so a waiting client sees its job start within a moment
+of the slot freeing instead of on its next poll.
+
+- `state`: the state the client last saw. If the job is no longer in it, the answer comes
+  at once. Always send it: without it the server compares with the state when the request
+  arrives, and a job that started between two polls would hold the request the full `N`.
+- The answer is the job, plus `"waited": <N as capped>`. A server older than this
+  feature ignores `wait` and answers at once without `waited`; fall back to plain polling
+  (the CLI polls every 5 s then).
+- `wait` that is not a number answers `400`.
+- A `run` job still needs `POST /v1/jobs/<id>/heartbeat` every 30 s or so; keep each
+  `wait` shorter than the time to the next heartbeat. Set the client's socket timeout
+  above `N`.
+
+```sh
+curl -H "Authorization: Bearer $FLEETQ_TOKEN" "$FLEETQ_URL/v1/jobs/57?wait=25&state=queued"
+```
 
 ### `GET /v1/status`
 
@@ -114,6 +135,6 @@ Job request (`label` and `owner` are required):
 }
 ```
 
-Poll `GET /v1/jobs/<id>` until `state` is `running`, do the work, then release. A harness
+Long-poll `GET /v1/jobs/<id>?wait=25&state=queued` until `state` is `running`, do the work, then release. A harness
 that only sends requests to an existing server should hold a shared lease with `uses` on
 that service's role, so nobody takes it down mid-run.

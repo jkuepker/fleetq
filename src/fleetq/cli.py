@@ -30,6 +30,7 @@ import urllib.request
 
 CONFIG_DIR = Path.home() / '.config' / 'fleetq'
 POLL_S, HEARTBEAT_S, OUTAGE_S, STOP_GRACE_S = 5, 30, 120, 30
+LONG_POLL_S = 25  # how long one GET /v1/jobs/<id>?wait=N may sit on the server
 EXIT_UNREACHABLE, EXIT_TIMEOUT, EXIT_CANCELLED = 2, 3, 4
 
 
@@ -59,13 +60,13 @@ class Client:
         self.token = token or setting('FLEETQ_TOKEN', 'token', '')
         self.timeout = timeout
 
-    def call(self, method, path, body=None):
+    def call(self, method, path, body=None, timeout=None):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, method=method,
                                      headers={'Authorization': 'Bearer ' + self.token,
                                               'Content-Type': 'application/json'})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             try:
@@ -161,8 +162,13 @@ BRIEF_RE = re.compile(r'#(\d+) "[^"]*" \(([^)]*)\)')
 
 
 def wait_until_running(client, job, timeout_s, heartbeat):
-    """Poll until the job runs. Returns the job, or None on timeout. Prints why it waits."""
+    """Wait until the job runs. Returns the job, or None on timeout. Prints why it waits.
+
+    Long-polls the server (GET ?wait=N answers as soon as the job changes); a server too old
+    to know `wait` answers at once without `waited`, and then this polls every POLL_S.
+    """
     last_reason, last_beat, start, down_since = None, time.time(), time.time(), None
+    long_poll = True
     while job['state'] == 'queued':
         if job.get('reason') != last_reason:
             say(f'#{job["id"]} waiting (#{job.get("position", "?")} in line): {job.get("reason") or "scheduling"}')
@@ -173,11 +179,22 @@ def wait_until_running(client, job, timeout_s, heartbeat):
                     f'with FLEETQ_JOB={mine[0]} set, or it will wait for #{mine[0]} to be released.')
         if timeout_s is not None and time.time() - start > timeout_s:
             return None
-        time.sleep(POLL_S)
+        if not long_poll:
+            time.sleep(POLL_S)
         try:
             if heartbeat and time.time() - last_beat >= HEARTBEAT_S:
                 job = client.call('POST', f'/v1/jobs/{job["id"]}/heartbeat', {})
                 last_beat = time.time()
+            elif long_poll:
+                wait = LONG_POLL_S
+                if heartbeat:
+                    wait = min(wait, last_beat + HEARTBEAT_S - time.time())
+                if timeout_s is not None:
+                    wait = min(wait, start + timeout_s - time.time())
+                wait = max(wait, 0.0)
+                job = client.call('GET', f'/v1/jobs/{job["id"]}?wait={wait:.2f}&state=queued',
+                                  timeout=wait + client.timeout)
+                long_poll = 'waited' in job
             else:
                 job = client.call('GET', f'/v1/jobs/{job["id"]}')
             down_since = None
@@ -186,6 +203,7 @@ def wait_until_running(client, job, timeout_s, heartbeat):
             down_since = down_since or time.time()
             if time.time() - down_since > OUTAGE_S:
                 raise
+            time.sleep(POLL_S)
     return job
 
 

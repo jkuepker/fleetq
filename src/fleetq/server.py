@@ -21,7 +21,8 @@ from .store import Store
 DEFAULTS = {'listen': '0.0.0.0', 'port': 8470, 'token_file': '/etc/fleetq/token',
             'db': '/var/lib/fleetq/fleetq.db', 'probe_interval_s': 30, 'stale_heartbeat_s': 180,
             'restore_grace_s': 600, 'machine_probe_port': 22, 'default_expect_min': 120,
-            'untracked_gb_warn': 6, 'wedge_after_s': 180}
+            'untracked_gb_warn': 6, 'wedge_after_s': 180, 'fast_probe_s': 5}
+MAX_WAIT_S = 30  # longest a GET /v1/jobs/<id>?wait=N holds the request open
 
 
 def load_config(path):
@@ -61,9 +62,13 @@ class Fleet:
         self.store = store or Store(self.cfg['db'])
         self.clock = clock
         self.lock = threading.RLock()
+        # Long-polls wait on this, never on self.lock; step() bumps version after every pass.
+        self.changed = threading.Condition()
+        self.version = 0
         self.obs = {}             # service name -> Observation
         self.job_obs = {}         # (job id, URL) -> Observation of a model server a running job brought up
         self.machine_online = {}  # machine -> bool
+        self.online_at = {}       # machine -> when machine_online was observed
         self.actual = {}          # host name -> (collector reading, observed at)
         self.last_probe = None
         self.collectors = {}
@@ -136,31 +141,87 @@ class Fleet:
                 self.store.event(now, 'started', f'#{job.id} started on {", ".join(job.hosts)}: {job.label}', job.id)
             elif job.id in reasons and reasons[job.id] != job.reason:
                 self.store.update_job(job.id, reason=reasons[job.id])
+        with self.changed:
+            self.version += 1
+            self.changed.notify_all()
 
-    def apply_probe(self, obs, online, free, now, job_obs=None):
+    def wait_job(self, job_id, wait_s, state=None):
+        """The job once its state differs from state (default: its state now) or its reason
+        changes, or after wait_s seconds. Holds no Fleet lock while it waits."""
+        deadline = time.monotonic() + wait_s
+        with self.changed:
+            seen = self.version
+        first = self.get(job_id)
+        if state is not None and first['state'] != state:
+            return first
+        job = first
+        while (left := deadline - time.monotonic()) > 0:
+            with self.changed:
+                self.changed.wait_for(lambda: self.version != seen, left)
+                seen = self.version
+            job = self.get(job_id)
+            if job['state'] != first['state'] or job['reason'] != first['reason']:
+                break
+        return job
+
+    def apply_probe(self, obs, online, free, now, job_obs=None, full=True):
+        """Store a probe's results. A result older than the one already stored is dropped:
+        a slow probe that started first must not overwrite what a later one saw."""
         with self.lock:
             for name, o in obs.items():
-                core.carry_stall(self.obs.get(name), o)
-            self.obs.update(obs)
+                prev = self.obs.get(name)
+                if prev is None or o.at >= prev.at:
+                    self.obs[name] = core.carry_stall(prev, o)
             # A job released while its URL was being checked must not come back with it.
             live = {j.id for j in self.store.active_jobs() if j.state == RUNNING}
-            self.job_obs = {k: o for k, o in {**self.job_obs, **(job_obs or {})}.items() if k[0] in live}
-            self.machine_online.update(online)
+            merged = dict(self.job_obs)
+            for k, o in (job_obs or {}).items():
+                if k not in merged or o.at >= merged[k].at:
+                    merged[k] = o
+            self.job_obs = {k: o for k, o in merged.items() if k[0] in live}
+            for m, up in online.items():
+                if now >= self.online_at.get(m, now):
+                    self.machine_online[m], self.online_at[m] = up, now
             for h, reading in free.items():
-                self.actual[h] = (reading, now)
-            self.last_probe = now
+                if h not in self.actual or now >= self.actual[h][1]:
+                    self.actual[h] = (reading, now)
+            if full:
+                self.last_probe = max(now, self.last_probe or now)
             self.step()
 
-    def probe_now(self):
+    def _job_targets(self, jobs):
+        return {f'job {j.id} {url}': (j.id, url, Service(f'job {j.id} {url}', j.hosts[0], url=url))
+                for j in jobs for url in j.serves}
+
+    def _probe(self, services, targets, machines, collectors, full):
         now = self.clock()
-        with self.lock:
-            targets = {f'job {j.id} {url}': (j.id, url, Service(f'job {j.id} {url}', j.hosts[0], url=url))
-                       for j in self.store.active_jobs() if j.state == RUNNING for url in j.serves}
-        obs, online, free = probes.probe_all(self.services + [t[2] for t in targets.values()],
-                                             self.machines, self.collectors, now,
-                                             self.cfg['machine_probe_port'])
+        obs, online, free = probes.probe_all(services + [t[2] for t in targets.values()],
+                                             machines, collectors, now, self.cfg['machine_probe_port'])
         job_obs = {(t[0], t[1]): obs.pop(name) for name, t in targets.items() if name in obs}
-        self.apply_probe(obs, online, free, now, job_obs)
+        self.apply_probe(obs, online, free, now, job_obs, full)
+
+    def probe_now(self):
+        with self.lock:
+            targets = self._job_targets(j for j in self.store.active_jobs() if j.state == RUNNING)
+        self._probe(self.services, targets, self.machines, self.collectors, True)
+
+    def fast_targets(self):
+        """What a job may be waiting to see come up: services restoring after a takedown,
+        and --serves URLs of running jobs that no check has seen serve a model yet."""
+        with self.lock:
+            _, running, _, statuses = self._view(self.clock())
+            services = [s for s in self.services if s.probed
+                        and statuses[s.name].code in ('restoring', 'not_restored')]
+            targets = {k: t for k, t in self._job_targets(running).items()
+                       if (o := self.job_obs.get(t[:2])) is None or o.state not in ('up', 'unverified')}
+            return services, targets
+
+    def probe_fast(self):
+        """Check just what fast_targets names; returns whether there was anything to check."""
+        services, targets = self.fast_targets()
+        if services or targets:
+            self._probe(services, targets, {}, {}, False)
+        return bool(services or targets)
 
     # ---- API operations ------------------------------------------------
     def resolve(self, p):
@@ -409,7 +470,10 @@ def make_handler(fleet, token, readonly_token=None):
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the client gave up first, e.g. a Ctrl-C during a long-poll
 
         def _scope(self):
             given = self.headers.get('Authorization', '')
@@ -466,7 +530,15 @@ def make_handler(fleet, token, readonly_token=None):
                 if len(route) >= 2 and route[0] == 'jobs' and route[1].isdigit():
                     job_id = int(route[1])
                     if method == 'GET' and len(route) == 2:
-                        return self._send(200, fleet.get(job_id))
+                        q = parse_qs(url.query)
+                        if 'wait' not in q:
+                            return self._send(200, fleet.get(job_id))
+                        try:
+                            wait_s = min(max(float(q['wait'][0]), 0.0), MAX_WAIT_S)
+                        except ValueError:
+                            raise ApiError(400, 'wait must be a number of seconds') from None
+                        state = q.get('state', [None])[0]
+                        return self._send(200, fleet.wait_job(job_id, wait_s, state) | {'waited': wait_s})
                     if method == 'POST' and route[2:] == ['heartbeat']:
                         return self._send(200, fleet.heartbeat(job_id))
                     if method == 'POST' and route[2:] == ['release']:
@@ -487,12 +559,21 @@ def make_handler(fleet, token, readonly_token=None):
 
 
 def probe_loop(fleet, stop):
+    """A full check every probe_interval_s; in between, every fast_probe_s, a check of just
+    what a job may be waiting to see come up (see Fleet.fast_targets)."""
+    full_s, fast_s = fleet.cfg['probe_interval_s'], fleet.cfg['fast_probe_s']
+    next_full = 0.0
     while not stop.is_set():
         try:
-            fleet.probe_now()
+            if time.monotonic() >= next_full:
+                next_full = time.monotonic() + full_s
+                fleet.probe_now()
+            elif fast_s:
+                fleet.probe_fast()
         except Exception as exc:  # keep the loop alive; the next cycle retries
             sys.stderr.write(f'probe cycle failed: {exc!r}\n')
-        stop.wait(fleet.cfg['probe_interval_s'])
+        left = next_full - time.monotonic()
+        stop.wait(min(fast_s, left) if fast_s and fast_s < full_s else left)
 
 
 def read_token(parser, path):
