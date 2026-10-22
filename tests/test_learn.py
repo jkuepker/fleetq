@@ -93,11 +93,25 @@ def test_learned_run_job_never_gets_a_backfill_deadline():
     given = job(3, kind='run', expect_s=10 * MIN)
     p = plan(w, [running, head, given])
     assert p.to_start == [3] and p.deadlines == {3: NOW + 3600}          # the same job, said by its owner
-    guessed = learned(3, 10, kind='run')
+    guessed = learned(3, 10, kind='run')                                 # 10 x 1.5 x 1.2 + 5 min = 23 min <= 60
     p = plan(w, [running, head, guessed])
+    assert p.to_start == [3] and p.deadlines == {}                       # goes first, but is never stopped
+    long = learned(3, 31, kind='run')                                    # 60.8 min > 60: would hold #2 up
+    p = plan(w, [running, head, long])
     assert p.to_start == [] and p.deadlines == {}
     assert p.reasons[3].startswith('in line behind #2')
     assert 'with --expect it may go first' in p.reasons[3]               # the way out is still named
+
+
+def test_only_a_learned_run_job_goes_ahead_of_a_waiting_job_on_its_margin():
+    w = World()
+    running = job(1, RUNNING, expect_s=3600, started_at=NOW)
+    head = job(2, quiet=['gpu'])
+    assert plan(w, [running, head, job(3, kind='run')]).to_start == []  # no estimate at all: waits
+    assert plan(w, [running, head, learned(3, 10)]).to_start == []      # a learned lease: waits
+    unknown = job(1, RUNNING, kind='run', started_at=NOW)                # #2 has no estimated start
+    p = plan(w, [unknown, head, learned(3, 10, kind='run')])
+    assert p.to_start == [] and 'no estimated start' in p.reasons[3]
 
 
 def test_learned_run_job_started_by_other_means_keeps_no_deadline():
@@ -220,15 +234,15 @@ def test_a_learned_job_is_flagged_overdue_at_twice_its_estimate(env):
     assert [e for e in fleet.store.events(50) if e['kind'] == 'overdue']
 
 
-def test_a_learned_run_job_waits_its_turn_where_a_given_one_goes_ahead(env):
+def test_a_learned_run_job_goes_ahead_with_no_deadline_where_a_given_one_gets_one(env):
     fleet, clock, url = env
     history(fleet, clock, 'train', 5)
     clock.t += 301
     fleet.submit({'label': 'hold', 'owner': 'me', 'hosts': ['a'], 'expect_min': 60})
     fleet.submit({'label': 'bench', 'owner': 'me', 'hosts': ['a'], 'quiet': ['gpu']})
     guessed = fleet.submit({'label': 'train-93', 'owner': 'me', 'hosts': ['a'], 'kind': 'run'})
-    assert guessed['state'] == 'queued' and guessed['expect_source'] == 'learned'
-    assert 'with --expect it may go first' in guessed['reason']
+    assert guessed['state'] == 'running' and guessed['expect_source'] == 'learned'   # 12.5 min x 1.8 + 5 fits in 60
+    assert guessed['deadline'] is None and guessed['deadline_in_s'] is None
     said = fleet.submit({'label': 'train-94', 'owner': 'me', 'hosts': ['a'], 'kind': 'run', 'expect_min': 12})
     assert said['state'] == 'running' and said['deadline'] is not None
 
@@ -610,3 +624,18 @@ def test_a_failing_refresh_never_stops_the_scheduling_pass(env, capsys):
     j = fleet.submit({'label': 'plain-1', 'owner': 'me', 'hosts': ['b'], 'kind': 'run', 'expect_min': 5})
     assert j['state'] == 'running'                                       # the pass still ran and started it
     assert 'relearn of queued jobs failed' in capsys.readouterr().err
+
+
+def test_a_running_learned_job_counts_until_its_margin_when_others_are_checked_against_a_reservation():
+    w = World()
+    booked = job(2, hosts=['b'], mem_gb=5.0, start_at=NOW + 1800, expect_s=1800.0)
+    first = learned(3, 30, kind='run', hosts=['b'], mem_gb=20.0)       # fits beside the reservation: starts
+    big = learned(7, 60, kind='run', hosts=['b'], mem_gb=80.0)         # fits only if #3 is gone by then
+    p = plan(w, [booked, first, big])
+    assert p.to_start == [3] and p.deadlines == {}                       # #3 may still be there at +30 min
+    assert p.reasons[7].startswith('would still be running when reservation #2 "j2" (o) starts')
+    said = job(3, RUNNING, kind='run', hosts=['b'], mem_gb=20.0, started_at=NOW, expect_s=1800.0,
+               deadline=NOW + 1800)                                      # a deadline is a sure end
+    assert plan(w, [booked, said, big]).to_start == [7]
+    over = learned(3, 30, state=RUNNING, kind='run', hosts=['b'], mem_gb=20.0, started_at=NOW - 7200)
+    assert plan(w, [booked, over, big]).to_start == []                   # past its margin: its end is unknown

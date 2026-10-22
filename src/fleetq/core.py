@@ -482,6 +482,17 @@ class Plan:
     line: list = field(default_factory=list)       # waiting job ids, first in line first
 
 
+def _sure_end(job, ends, now, default_expect_s):
+    """When a running job is surely off its box, for deciding whether it is still there when a
+    waiting job or reservation starts. A learned estimate has no deadline behind it, so it is
+    held to its margin (protect_s) from its start, and once past that its end is unknown. Any
+    other job ends at its expected end (see expected_end)."""
+    if job.learned() and job.deadline is None:
+        end = (job.started_at if job.started_at is not None else now) + job.protect_s(default_expect_s)
+        return end if end > now else None
+    return ends[job.id]
+
+
 def _ahead_ok(job, protected, booked_ids, running, ends, starts, now, default_expect_s,
               hosts, services, statuses):
     """May job start now without holding up anything it would jump? (why not, deadline)
@@ -489,7 +500,9 @@ def _ahead_ok(job, protected, booked_ids, running, ends, starts, now, default_ex
     protected: jobs waiting ahead of it, and reservations not yet due, on its hosts. For each
     one it would hold up (see hinders): a run job with --expect goes first only if it should
     end well before that one's start (backfill_fits), and must end by then (its deadline);
-    other jobs go before a reservation only if their --expect (or the default) ends first.
+    a run job with a learned expect goes first if its margin (protect_s) ends before that
+    start, with no deadline, since nothing is stopped on a guess; other jobs go before a
+    reservation only if their --expect (or the default) ends first.
     A due reservation is held to its booked window, not to now: booking checked that it ends
     before later reservations start, and the scheduling pass always runs a little after its
     start. If it then runs late, that is the overrun flag, not a reason to wait.
@@ -497,7 +510,7 @@ def _ahead_ok(job, protected, booked_ids, running, ends, starts, now, default_ex
     deadline = None
     for w in protected:
         at = starts.get(w.id)
-        still = [o for o in running if at is None or ends[o.id] is None or ends[o.id] > at]
+        still = [o for o in running if at is None or (e := _sure_end(o, ends, now, default_expect_s)) is None or e > at]
         if not hinders(job, w, still, hosts, services, statuses):
             continue
         booked = w.id in booked_ids
@@ -507,7 +520,8 @@ def _ahead_ok(job, protected, booked_ids, running, ends, starts, now, default_ex
             if at is not None and job.expect_s <= backfill_fits(at, now):
                 deadline = at if deadline is None else min(deadline, at)
                 continue
-        elif booked and now + job.protect_s(default_expect_s) <= at:
+        elif (booked or job.kind == 'run' and job.learned()) and at is not None \
+                and now + job.protect_s(default_expect_s) <= at:
             continue
         if booked:
             why = f'would still be running when reservation {w.brief()} starts'

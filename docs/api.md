@@ -279,8 +279,9 @@ the cap. A refused `expect_auto` leaves the plain learned estimate and adds `aut
 to the response of `POST /v1/jobs` and `POST /v1/when`. Rows from before the column read as `given` when they have an `expect_s`.
 A learned expect never sets a backfill `deadline`; it does estimate a running job's end
 (`start_in_s` of what waits, `POST /v1/when`, which also answers `expect_s` (the estimate in use), `expect_source`
-and `expect_n`), flags `overdue` at twice it, and lets a job start ahead of a reservation
-only if 1.5 times it, x1.2 and plus 5 minutes (at most the default), ends before the reservation does;
+and `expect_n`), flags `overdue` at twice it, and lets a job start ahead of a reservation (or a `run` job ahead of a waiting job)
+only if 1.5 times it, x1.2 and plus 5 minutes (at most the default), ends before that one starts;
+queued jobs without a given expect are re-estimated every 5 minutes;
 a waiting job's slot counts as `default_expect_min` long when a reservation is checked against the line. `learn_days = 0` turns learning off.
 
 **Reservations.** A job with `start_in_s` / `start_at` (and a length, `expect_min`) waits

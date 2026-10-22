@@ -201,14 +201,16 @@ fleetq: #71 expect ~12m, learned from 9 similar runs; pass --expect to set it
 `fleetq show`, `status` and `when` show it too ("expect ~12m (learned from 9 runs)"). A learned
 estimate is a guess, so it is held to a shorter leash than something you said:
 
-- It **never sets a deadline**. A run job with only a learned expect waits its turn; nothing is
-  stopped on a guess.
+- It **never sets a deadline**; nothing is stopped on a guess.
+- A `run` job with a learned expect goes ahead of a waiting job, or a reservation, only if 1.5x
+  of it, plus the margin a backfill asks (x1.2 and 5 minutes), ends before that one starts.
 - It estimates when a running job frees its box, so `fleetq when` and the queue's "estimated
   start" work for jobs that gave no `--expect`.
 - A job is flagged overdue at twice its learned expect, not at 1x.
-- It starts ahead of a reservation only if 1.5x of it, plus the margin a backfill asks (x1.2 and
-  5 minutes), ends before the reservation does; a waiting job with a learned expect still keeps
-  a default-sized window clear for bookings.
+- Any job with a learned expect (a lease too) starts ahead of a reservation on that same margin;
+  a waiting job with a learned expect still keeps a default-sized window clear for bookings.
+- Queued jobs are re-estimated every 5 minutes, so a job queued before its label had history
+  gets one once it does.
 
 `--expect auto` (on `run`, `acquire`, `when`) opts in: the learned value counts as one you gave,
 so a `run` job may go ahead of the line with a deadline, and may be stopped there. Because of
