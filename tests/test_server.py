@@ -349,11 +349,11 @@ def test_waiting_client_rides_out_a_brief_server_outage(env, monkeypatch):
     client = cli.Client()
     real, calls = client.call, []
 
-    def flaky(method, path, body=None):
+    def flaky(method, path, body=None, timeout=None):
         calls.append(path)
         if len(calls) <= 2:
             raise cli.Unreachable('restarting')
-        return {**real(method, path, body), 'state': 'running'}
+        return {**real(method, path, body, timeout), 'state': 'running'}
     monkeypatch.setattr(client, 'call', flaky)
     got = cli.wait_until_running(client, {**job, 'state': 'queued'}, None, heartbeat=False)
     assert got['state'] == 'running' and len(calls) == 3
@@ -581,3 +581,173 @@ def test_run_serves_flag_reaches_the_job(env):
     assert code == 0
     recent = api(url, 'GET', '/v1/status')[1]['recent'][0]
     assert recent['serves'] == ['http://ma:8002/v1'] and recent['serves_caps'] == ['text', 'image']
+
+
+def test_long_poll_answers_as_soon_as_the_job_starts(env):
+    _, _, url = env
+    _, hold = api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'o', 'hosts': ['a'], 'exclusive': True})
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'o', 'hosts': ['a']})
+    got = {}
+
+    def poll():
+        start = time.monotonic()
+        got['job'] = api(url, 'GET', f'/v1/jobs/{job["id"]}?wait=20&state=queued')[1]
+        got['took'] = time.monotonic() - start
+    t = threading.Thread(target=poll)
+    t.start()
+    t.join(0.3)
+    assert t.is_alive()  # held open while nothing changes
+    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'o'})
+    t.join(5)
+    assert got['job']['state'] == 'running' and got['job']['waited'] == 20 and got['took'] < 2
+
+
+def test_long_poll_times_out_and_answers_at_once_when_the_state_already_moved(env):
+    _, _, url = env
+    _, hold = api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'o', 'hosts': ['a'], 'exclusive': True})
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'o', 'hosts': ['a']})
+    start = time.monotonic()
+    code, body = api(url, 'GET', f'/v1/jobs/{job["id"]}?wait=0.3')
+    assert code == 200 and body['state'] == 'queued' and 0.25 < time.monotonic() - start < 2
+    # The hold started before this request: the client saw it queued, so no waiting at all.
+    start = time.monotonic()
+    assert api(url, 'GET', f'/v1/jobs/{hold["id"]}?wait=20&state=queued')[1]['state'] == 'running'
+    assert time.monotonic() - start < 1
+    assert api(url, 'GET', f'/v1/jobs/{job["id"]}?wait=soon')[0] == 400
+    assert 'waited' not in api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]
+
+
+def test_long_poll_ignores_passes_that_change_nothing_for_its_job(env):
+    fleet, clock, url = env
+    _, hold = api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'o', 'hosts': ['a'], 'exclusive': True})
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'o', 'hosts': ['a']})
+    got = {}
+    t = threading.Thread(target=lambda: got.update(job=fleet.wait_job(job['id'], 20, 'queued')))
+    t.start()
+    for _ in range(5):  # probes and other jobs wake the waiter; it goes back to sleep
+        fleet.apply_probe({'a-llm': Observation('up', ['m'], 0, at=clock.t)}, {}, {}, clock.t)
+        api(url, 'POST', '/v1/jobs', {'label': 'elsewhere', 'owner': 'o', 'hosts': ['b']})
+        time.sleep(0.02)
+    t.join(0.2)
+    assert t.is_alive()
+    api(url, 'POST', f'/v1/jobs/{hold["id"]}/release', {'owner': 'o'})
+    t.join(5)
+    assert got['job']['state'] == 'running'
+
+
+def test_waiting_run_starts_without_waiting_for_the_next_poll(env, tmp_path, monkeypatch):
+    _, _, url = env
+    monkeypatch.setattr(cli, 'POLL_S', 10)  # plain polling would take 10 s to notice
+    marker = tmp_path / 'ran'
+    t, result, job_id = start_queued_run(url, marker)
+    time.sleep(0.2)
+    hold = api(url, 'GET', '/v1/status')[1]['hosts'][0]['running'][0]['id']
+    start = time.monotonic()
+    api(url, 'POST', f'/v1/jobs/{hold}/release', {'owner': 'other'})
+    t.join(5)
+    assert result['code'] == 0 and marker.exists() and time.monotonic() - start < 2
+
+
+def test_waiting_client_falls_back_to_polling_an_old_server(env, monkeypatch):
+    _, _, url = env
+    monkeypatch.setattr(cli, 'LONG_POLL_S', 10)
+    api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'o', 'hosts': ['a'], 'exclusive': True})
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'o', 'hosts': ['a']})
+    client = cli.Client()
+    calls = []
+
+    def old_server(method, path, body=None, timeout=None):
+        calls.append(path)
+        got = {k: v for k, v in client.__class__.call(client, method, path.split('?')[0], body).items()}
+        return got | ({'state': 'running'} if len(calls) >= 3 else {})
+    monkeypatch.setattr(client, 'call', old_server)
+    start = time.monotonic()
+    got = cli.wait_until_running(client, job, None, heartbeat=False)
+    assert got['state'] == 'running' and time.monotonic() - start < 2
+    assert '?wait=' in calls[0] and all('?' not in c for c in calls[1:])
+
+
+def test_heartbeats_keep_flowing_during_long_polls(env, monkeypatch):
+    _, _, url = env
+    monkeypatch.setattr(cli, 'HEARTBEAT_S', 0.3)
+    api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'o', 'hosts': ['a'], 'exclusive': True})
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'o', 'hosts': ['a'], 'kind': 'run'})
+    client = cli.Client()
+    real, calls = client.call, []
+    monkeypatch.setattr(client, 'call', lambda m, p, b=None, timeout=None: calls.append(p) or real(m, p, b, timeout))
+    assert cli.wait_until_running(client, job, 1.0, heartbeat=True) is None
+    assert sum(c.endswith('/heartbeat') for c in calls) >= 2
+
+
+def test_an_older_probe_result_does_not_overwrite_a_newer_one(env):
+    fleet, clock, url = env
+    newer = clock.t + 10
+    fleet.apply_probe({'a-llm': Observation('down', detail='gone', at=newer)}, {'ma': False}, {}, newer)
+    fleet.apply_probe({'a-llm': Observation('up', ['m'], 0, at=clock.t)}, {'ma': True}, {}, clock.t)
+    assert fleet.obs['a-llm'].state == 'down' and fleet.machine_online['ma'] is False
+    assert fleet.last_probe == newer
+
+
+def test_slow_concurrent_probe_loses_to_the_later_one(env, monkeypatch):
+    fleet, clock, url = env
+    from fleetq import probes
+    first_started, second_done = threading.Event(), threading.Event()
+
+    def probe_all(services, machines, collectors, now, port=22):
+        if not first_started.is_set():  # the loop's probe: slow, sees the service down
+            first_started.set()
+            second_done.wait(5)
+            return {'a-llm': Observation('down', detail='slow', at=now)}, {}, {}
+        return {'a-llm': Observation('up', ['m'], 0, at=now)}, {}, {}
+    monkeypatch.setattr(probes, 'probe_all', probe_all)
+    slow = threading.Thread(target=fleet.probe_now)
+    slow.start()
+    first_started.wait(5)
+    clock.t += 1
+    fleet.probe_now()  # POST /v1/probe, say
+    second_done.set()
+    slow.join(5)
+    assert fleet.obs['a-llm'].state == 'up'
+
+
+def test_fast_probe_checks_only_what_a_job_waits_to_see_come_up(env, monkeypatch):
+    fleet, clock, url = env
+    from fleetq import probes
+    probed = []
+
+    def probe_all(services, machines, collectors, now, port=22):
+        probed.append(([s.name for s in services], dict(machines)))
+        return {s.name: Observation('up', ['m'], 0, at=now) for s in services}, {}, {}
+    monkeypatch.setattr(probes, 'probe_all', probe_all)
+    assert fleet.probe_fast() is False and probed == []
+    _, swap = api(url, 'POST', '/v1/jobs', {'label': 'swap', 'owner': 'o', 'takes_down': ['flight']})
+    _, user = api(url, 'POST', '/v1/jobs', {'label': 'mission', 'owner': 'o', 'uses': ['flight']})
+    clock.t += 60
+    api(url, 'POST', f'/v1/jobs/{swap["id"]}/release', {'owner': 'o'})
+    before = fleet.last_probe
+    clock.t += 5
+    assert fleet.probe_fast() is True
+    assert probed == [(['a-llm'], {})] and fleet.last_probe == before
+    assert api(url, 'GET', f'/v1/jobs/{user["id"]}')[1]['state'] == 'running'
+    assert fleet.probe_fast() is False  # restored: nothing left to watch
+    probed.clear()
+    _, srv = api(url, 'POST', '/v1/jobs', {'label': 'serve', 'owner': 'o', 'hosts': ['b'],
+                                          'serves': ['http://mb:9000/v1']})
+    assert fleet.probe_fast() is True and probed == [([f'job {srv["id"]} http://mb:9000/v1'], {})]
+    assert fleet.probe_fast() is False  # it serves a model now
+
+
+def test_probe_loop_runs_fast_checks_between_full_ones(env, monkeypatch):
+    fleet, _, _ = env
+    from fleetq import server
+    fleet.cfg.update(probe_interval_s=0.5, fast_probe_s=0.1)
+    calls = []
+    monkeypatch.setattr(fleet, 'probe_now', lambda: calls.append('full'))
+    monkeypatch.setattr(fleet, 'probe_fast', lambda: calls.append('fast'))
+    stop = threading.Event()
+    t = threading.Thread(target=server.probe_loop, args=(fleet, stop))
+    t.start()
+    time.sleep(1.05)
+    stop.set()
+    t.join(2)
+    assert calls.count('full') >= 2 and calls.count('fast') >= 3
