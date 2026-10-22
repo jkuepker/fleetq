@@ -583,6 +583,10 @@ def plan(jobs, hosts, services, statuses, obs, host_online, actual_free, actual_
         elif ahead:
             lines = [h for h in job.hosts if h in ahead[0].hosts and h not in clears]
             why = f'in line behind {ahead[0].brief()} on {", ".join(lines)}'
+            held = next((o for o in running if o.exclusive and set(o.hosts) & set(lines)), None)
+            if held:                                    # name what holds everyone up, not just the line
+                h = next(h for h in lines if h in held.hosts)
+                why = f'{h} is held exclusively by {held.brief()}; then {why}'
         if why:
             p.reasons[job.id] = why
             p.starts[job.id] = earliest_start(job, running, ends, hosts, services, statuses)

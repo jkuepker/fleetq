@@ -189,7 +189,7 @@ def test_takedown_of_a_wedged_service_goes_to_the_front_of_that_hosts_line():
     # The skip is per host: on b, where nothing is wedged, #4 still waits its turn.
     b_line = job(0, hosts=['b'], exclusive=True)
     start, why = w.plan([b_line, bench, both, b_first])
-    assert 4 not in start and why[4].startswith('in line behind #0') and why[4].endswith('on b')
+    assert 4 not in start and 'then in line behind #0' in why[4] and why[4].endswith('on b')
 
 
 def test_offline_host_and_unchecked_host_block():
@@ -572,3 +572,11 @@ def test_forecast_estimates_the_start_from_expected_ends():
     w.obs['a-llm'] = Observation('down', at=NOW)
     needs = job(4, uses=['a-llm'])
     assert core.forecast([needs], 4, w.hosts, w.services, statuses_for, w.obs, w.online, {}, {}, NOW) == (None, None)
+
+
+def test_a_job_in_line_behind_an_exclusive_holder_names_the_holder_first():
+    w = World()
+    holder = job(1, RUNNING, exclusive=True, started_at=NOW, expect_s=3600)
+    start, why = w.plan([holder, job(2), job(3)])
+    assert start == [] and why[2] == 'a is held exclusively by #1 "j1" (o)'
+    assert why[3] == 'a is held exclusively by #1 "j1" (o); then in line behind #2 "j2" (o) on a'
