@@ -174,7 +174,7 @@ class Fleet:
     def _stale(self, job, now):
         """A running job whose heartbeats stopped: a run job's client, or a lease's keepalive."""
         return (job.state == RUNNING and (job.kind == 'run' or job.keepalive) and job.heartbeat_at is not None
-                and now - job.heartbeat_at > self.cfg['stale_heartbeat_s'])
+                and self._silent_s(job, now) > self.cfg['stale_heartbeat_s'])
 
     def _silent_s(self, job, now):
         """How long a job's heartbeats have been missing while this server was up to receive them, so

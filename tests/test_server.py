@@ -1014,13 +1014,16 @@ def run_hook(tmp_path, event, payload, owner=None):
     return out.stdout
 
 
-def test_stop_hook_reminds_once_about_held_leases(env, tmp_path):
+def test_stop_hook_reminds_once_about_leases_others_wait_for(env, tmp_path):
     _, _, url = env
-    _, job = api(url, 'POST', '/v1/jobs', {'label': 'bench loop', 'owner': 'claude-abcd1234', 'hosts': ['a']})
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'bench loop', 'owner': 'claude-abcd1234-bench', 'hosts': ['a']})
     api(url, 'POST', '/v1/jobs', {'label': 'theirs', 'owner': 'claude-other', 'hosts': ['b']})
+    assert run_hook(tmp_path, 'stop', {'session_id': 'abcd1234-5678'}) == ''  # nobody waits: no extra turn
+    api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'claude-other', 'hosts': ['a'], 'exclusive': True})
     reply = json.loads(run_hook(tmp_path, 'stop', {'session_id': 'abcd1234-5678'}))
     assert reply['decision'] == 'block'
-    assert f'#{job["id"]} "bench loop"' in reply['reason'] and 'theirs' not in reply['reason']
+    assert f'#{job["id"]} "bench loop" (running 0m, 1 waiting behind it)' in reply['reason']
+    assert 'theirs' not in reply['reason']
     assert run_hook(tmp_path, 'stop', {'session_id': 'abcd1234-5678', 'stop_hook_active': True}) == ''
     assert run_hook(tmp_path, 'stop', {'session_id': 'ffff0000'}) == ''
 
@@ -1029,8 +1032,10 @@ def test_session_end_hook_releases_plain_leases_only(env, tmp_path):
     _, _, url = env
     owner = 'claude-abcd1234'
     _, plain = api(url, 'POST', '/v1/jobs', {'label': 'plain', 'owner': owner, 'hosts': ['a']})
+    _, task = api(url, 'POST', '/v1/jobs', {'label': 'task', 'owner': owner + '-gc', 'hosts': ['a']})
     _, box = api(url, 'POST', '/v1/jobs', {'label': 'reboot', 'owner': owner, 'hosts': ['b'], 'exclusive': True})
     run_hook(tmp_path, 'session-end', {'session_id': 'whatever', 'reason': 'exit'}, owner=owner)
-    got = api(url, 'GET', f'/v1/jobs/{plain["id"]}')[1]
-    assert got['state'] == 'done' and got['note'] == 'session ended (exit)'
+    for job in (plain, task):
+        got = api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]
+        assert got['state'] == 'done' and got['note'] == 'session ended (exit)'
     assert api(url, 'GET', f'/v1/jobs/{box["id"]}')[1]['state'] == 'running'
