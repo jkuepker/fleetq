@@ -23,6 +23,9 @@ probe_interval_s = 30
 # and the --serves URLs of running jobs that are still starting (0 = off).
 fast_probe_s = 5
 stale_heartbeat_s = 180
+# A lease whose session's keepalive has been silent this long is released as abandoned
+# (exclusive and takes-down leases are only flagged).
+abandon_after_s = 1200
 # A reserved slot nobody claims within this long of its start lapses.
 noshow_after_s = 900
 restore_grace_s = 600

@@ -24,7 +24,7 @@ DEFAULTS = {'listen': '0.0.0.0', 'port': 8470, 'token_file': '/etc/fleetq/token'
             'db': '/var/lib/fleetq/fleetq.db', 'probe_interval_s': 30, 'stale_heartbeat_s': 180,
             'restore_grace_s': 600, 'machine_probe_port': 22, 'default_expect_min': 120,
             'untracked_gb_warn': 6, 'wedge_after_s': 180, 'events_keep_days': 180,
-            'unclaimed_after_s': 600, 'fast_probe_s': 5, 'noshow_after_s': 900,
+            'unclaimed_after_s': 600, 'fast_probe_s': 5, 'noshow_after_s': 900, 'abandon_after_s': 1200,
             'job_notify': False, 'job_notify_hosts': ['ntfy.sh'], 'learn_days': 30,
             'learn_min_samples': 3, 'learn_quantile': 0.8, 'learn_factor': 1.25}
 MAX_STATS_DAYS = 3650
@@ -93,6 +93,7 @@ class Fleet:
         self.stepped_at = None    # server clock at the last scheduling pass
         self.learned = {}         # job kind -> (read at, learn.index of its finished jobs)
         self.relearned_at = None  # server clock at the last relearn_queued pass
+        self.started_at = clock()  # heartbeats missed while this server was down count from here
         self.collectors = {}
         for name, h in self.host_cfg.items():
             token_file = h.get('collector_token_file')
@@ -134,10 +135,14 @@ class Fleet:
     def _flags(self, job, now, ctx=None):
         ctx = ctx or self._context(now)
         flags = []
-        if job.state == RUNNING and job.kind == 'run' and job.heartbeat_at \
-                and now - job.heartbeat_at > self.cfg['stale_heartbeat_s']:
+        if self._stale(job, now) and job.kind == 'run':
             flags.append(f'stale: no heartbeat for {human(now - job.heartbeat_at)}; '
                          'the client may be gone, the work may still be running')
+        elif self._stale(job, now):
+            flags.append(f'stale: its session\'s keepalive stopped {human(now - job.heartbeat_at)} ago; '
+                         + (f'fleetq will not release it because it {self._held_why(job)}: check on its session, '
+                            f'or fleetq release {job.id} --force' if self._held_why(job) else
+                            f'released as abandoned after {human(self.cfg["abandon_after_s"])}'))
         if job.state == RUNNING and job.overdue_after() and job.started_at \
                 and now > job.started_at + job.overdue_after():
             flags.append(f'overdue: expected {human(job.estimate_s())}{self._guess(job)}, '
@@ -165,6 +170,31 @@ class Fleet:
                     flags.append(f'GPU on {h} is {util:.0%} busy, but no job there declares --load gpu; if this '
                                  'job uses the GPU, queue it again with --load gpu')
         return flags
+
+    def _stale(self, job, now):
+        """A running job whose heartbeats stopped: a run job's client, or a lease's keepalive."""
+        return (job.state == RUNNING and (job.kind == 'run' or job.keepalive) and job.heartbeat_at is not None
+                and now - job.heartbeat_at > self.cfg['stale_heartbeat_s'])
+
+    def _silent_s(self, job, now):
+        """How long a job's heartbeats have been missing while this server was up to receive them, so
+        a restart after downtime does not drop every job before its client could reach it again."""
+        return now - max(job.heartbeat_at, self.started_at)
+
+    def _abandoned(self, job, now):
+        """A kept-alive lease whose session has been gone for abandon_after_s."""
+        return (self._stale(job, now) and job.kind == 'lease'
+                and self._silent_s(job, now) > self.cfg['abandon_after_s'])
+
+    @staticmethod
+    def _held_why(job):
+        """Why an abandoned lease is not released on its own ('' if it is): freeing a box mid-reboot or
+        a service mid-swap is worse than waiting for someone to look."""
+        if job.exclusive:
+            return f'holds {", ".join(job.hosts)} exclusively'
+        if job.takes_down:
+            return f'takes down {", ".join(job.takes_down)}'
+        return ''
 
     @staticmethod
     def _guess(job):
@@ -200,7 +230,8 @@ class Fleet:
 
     # ---- scheduling ----------------------------------------------------
     def step(self):
-        """Clear confirmed restores, drop abandoned waiters, start whatever may start, flag unclaimed leases."""
+        """Clear confirmed restores, drop abandoned waiters and leases, start whatever may start, flag
+        unclaimed leases."""
         now = self.clock()
         try:
             self.relearn_queued(now)
@@ -211,11 +242,15 @@ class Fleet:
                 self.store.clear_restore(name)
                 self.store.event(now, 'restored', f'{name} is back after #{rest.job_id}', rest.job_id, name)
         for job in self.store.active_jobs():
-            if job.state == QUEUED and (job.kind == 'run' or job.watch) and job.heartbeat_at \
-                    and now - job.heartbeat_at > self.cfg['stale_heartbeat_s']:
+            if job.state == QUEUED and (job.kind == 'run' or job.watch or job.keepalive) and job.heartbeat_at \
+                    and self._silent_s(job, now) > self.cfg['stale_heartbeat_s']:
                 self.store.update_job(job.id, state=CANCELLED, ended_at=now,
                                       note='client stopped waiting (no heartbeat)')
                 self.store.event(now, 'abandoned', f'#{job.id} dropped from the queue: its client went away', job.id)
+            elif self._abandoned(job, now) and not self._held_why(job):
+                self._end(job, now, CANCELLED, 'abandoned: its session went away (keepalive stopped)')
+                self.store.event(now, 'abandoned', f'#{job.id} released: its session\'s keepalive stopped '
+                                 f'{human(now - job.heartbeat_at)} ago: {job.label}', job.id)
             elif self._lapsed(job, now):
                 # Nobody claimed it, so it never stopped anything: nothing to wait to see restored.
                 self._end(job, now, CANCELLED, 'no-show: nobody claimed the reservation', restore=False)
@@ -285,10 +320,12 @@ class Fleet:
         for job in self.store.active_jobs():
             if job.state != RUNNING:
                 continue
-            if job.kind == 'run' and job.heartbeat_at and now - job.heartbeat_at > self.cfg['stale_heartbeat_s'] \
-                    and not self.store.has_event_since('stale', job.heartbeat_at, job.id):
+            if self._stale(job, now) and not self.store.has_event_since('stale', job.heartbeat_at, job.id):
+                held = self._held_why(job)
+                then = ('' if job.kind == 'run' else f'; it {held}, so fleetq will not release it' if held
+                        else f'; released after {human(self.cfg["abandon_after_s"])} unless it comes back')
                 self.store.event(now, 'stale', f'#{job.id} has sent no heartbeat for '
-                                 f'{human(now - job.heartbeat_at)}; its client may be gone: {job.label}', job.id)
+                                 f'{human(now - job.heartbeat_at)}; its client may be gone{then}: {job.label}', job.id)
             if job.overdue_after() and job.started_at and now > job.started_at + job.overdue_after() \
                     and not self.store.has_event(job.id, 'overdue'):
                 self.store.event(now, 'overdue', f'#{job.id} expected {human(job.estimate_s())}{self._guess(job)}, running '
@@ -657,16 +694,18 @@ class Fleet:
                 position = 1 + sum(1 for j in queued if key(j) < key(job) and set(j.hosts) & set(job.hosts))
             return self._job_dict(job, now, position)
 
-    def heartbeat(self, job_id, owner=None):
+    def heartbeat(self, job_id, owner=None, keepalive=False):
         """A client is still there. One that names an owner other than the job's keeps nothing
-        alive and claims nothing; one that names none (older clients) counts as the owner."""
+        alive and claims nothing; one that names none (older clients) counts as the owner. keepalive:
+        sent by a lease's keepalive process, after which the lease ends when its heartbeats stop."""
         with self.lock, self.store.transaction():
             job = self.store.job(job_id)
             if not job:
                 raise ApiError(404, f'no job #{job_id}')
             if job.state in (QUEUED, RUNNING) and (owner is None or owner == job.owner):
                 now = self.clock()
-                self.store.update_job(job_id, heartbeat_at=now, seen_at=now)
+                extra = {'keepalive': 1} if keepalive and job.kind == 'lease' else {}
+                self.store.update_job(job_id, heartbeat_at=now, seen_at=now, **extra)
             return self.get(job_id)
 
     def unwatch(self, job_id):
@@ -1025,7 +1064,8 @@ def make_handler(fleet, token, readonly_token=None):
                         state = q.get('state', [None])[0]
                         return self._send(200, fleet.wait_job(job_id, wait_s, state, owner) | {'waited': wait_s})
                     if method == 'POST' and route[2:] == ['heartbeat']:
-                        return self._send(200, fleet.heartbeat(job_id, self._body().get('owner')))
+                        body = self._body()
+                        return self._send(200, fleet.heartbeat(job_id, body.get('owner'), bool(body.get('keepalive'))))
                     if method == 'POST' and route[2:] == ['unwatch']:
                         return self._send(200, fleet.unwatch(job_id))
                     if method == 'POST' and route[2:] == ['release']:

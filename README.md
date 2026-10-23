@@ -103,6 +103,23 @@ fleetq acquire --host gpu-b --mem 40 --label "try GLM 5.3" --expect 90 --wait
 fleetq release 57
 ```
 
+**Keepalive.** A session that dies or forgets would otherwise hold its lease forever, so
+`acquire` starts a small detached process that heartbeats the lease while the session that took
+it lives: `FLEETQ_KEEPALIVE_PID` if set, else Claude Code's own process (`CLAUDE_PID`, or the
+nearest ancestor named `claude`), else the shell of a human at a terminal. When that process
+exits, the heartbeats stop: after `stale_heartbeat_s` the lease is flagged stale (and notified),
+and after `abandon_after_s` (default 1200 s, long enough for a laptop to sleep a while) it is
+released as `abandoned`. A lease that is `--exclusive` or `--takes-down` something is only
+flagged, never released, since freeing a box mid-reboot is worse than waiting for someone to
+look. With no session process to follow (some other harness whose shell exits after each
+command), `acquire` says so and starts none. `--no-keepalive` skips it, for a lease another
+process will release.
+
+For Claude Code, [`deploy/claude-hooks.py`](deploy/claude-hooks.py) adds two hooks: at the end
+of each turn, a session that still holds leases is asked once to release what it is done with;
+when a session ends, its leases are released (exclusive and takes-down ones excepted). Its
+docstring has the settings snippet.
+
 Take a fleet role down to test something else. Anyone who needs the role waits until it is
 back; fleetq only counts it back once a health check sees the expected model again.
 
@@ -263,6 +280,7 @@ exits 0 when `FLEETQ_JOB` covers X.
 | `--load` | what it loads heavily: `gpu`, `cpu`, `net`, `disk` (default `gpu`; `none`) |
 | `--quiet` | what no other job may load meanwhile (a benchmark: `gpu,cpu`); `gpu` also waits for untracked GPU load |
 | `--expect MIN\|auto` | expected minutes: overdue flag; lets a `run` job go ahead of the line if it fits. Omitted: learned from similar finished jobs (never a deadline); `auto`: take that estimate as given |
+| `--no-keepalive` | `acquire`: do not heartbeat the lease while this session lives, so it is never released for you |
 | `--at TIME` / `--in DUR` | `run` / `reserve`: start no earlier than this (`14:30`, `tomorrow 09:00`, `90m`) |
 | `--uses` | roles/services that must be up; shared with other users |
 | `--takes-down` | roles/services this job stops; must come back afterwards |
@@ -285,8 +303,9 @@ the command never ran. `acquire --wait` also returns 4 then.
    jobs), and, where a hardware collector is connected, in the memory the box actually
    reports free.
 3. **Only the owner releases** a job (`--force` overrides, and the log records it).
-   fleetq never releases running work by itself; the one exception is a reserved slot nobody
-   claimed within `noshow_after_s` of its start, which lapses. A `run` job whose client stops
+   fleetq never releases running work by itself, with two exceptions: a reserved slot nobody
+   claimed within `noshow_after_s` of its start lapses, and a lease whose session is gone is
+   released (see **Keepalive** below). A `run` job whose client stops
    heartbeating is flagged stale; a lease past `--expect` is flagged overdue. A lease that
    started while no client had looked at it (heartbeat, `fleetq show`/`wait`, or a
    `FLEETQ_JOB` command inside it) for `unclaimed_after_s` (default 600 s) is flagged
@@ -294,8 +313,8 @@ the command never ran. `acquire --wait` also returns 4 then.
 4. **Waiters that vanish leave the line.** A queued `run` job, or a lease queued by
    `acquire --wait`, whose client stops heartbeating for `stale_heartbeat_s` (default 180 s)
    is dropped, so a killed agent tool call does not later hold a box nobody uses. Ctrl-C or
-   `--wait-timeout` on `acquire --wait` keeps the lease in line, as does `acquire` without
-   `--wait` (it never heartbeats).
+   `--wait-timeout` on `acquire --wait` keeps the lease in line. A lease whose keepalive stops
+   while it is still queued is dropped the same way.
 5. **Wedged servers.** A service that reports requests in flight while its engine step
    counter (vLLM `iteration_tokens_total_count`, llama.cpp `n_decode_total`) stays frozen
    for `wedge_after_s` (default 180 s) shows as `WEDGED`. vLLM on GB10 freezes like this
