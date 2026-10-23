@@ -49,7 +49,7 @@ ADDED_COLUMNS = {'mem_map': "TEXT NOT NULL DEFAULT '{}'", 'serves': "TEXT NOT NU
                  # Older rows have no source: Job derives it (given if expect_s is set, else default).
                  'expect_source': "TEXT NOT NULL DEFAULT ''", 'expect_n': 'INTEGER NOT NULL DEFAULT 0',
                  # The server's learned estimate; expect_s never holds one (an older server would take it as stated).
-                 'expect_learned_s': 'REAL'}
+                 'expect_learned_s': 'REAL', 'keepalive': 'INTEGER NOT NULL DEFAULT 0'}
 
 
 class Store:
@@ -100,6 +100,7 @@ class Store:
             data[f] = json.loads(data[f])
         data['exclusive'] = bool(data['exclusive'])
         data['watch'] = bool(data['watch'])
+        data['keepalive'] = bool(data['keepalive'])
         # Columns a newer version added are ignored, so rolling back never breaks reading jobs.
         return Job(**{k: v for k, v in data.items() if k in JOB_FIELDS})
 
@@ -107,13 +108,14 @@ class Store:
         cur = self.db.execute(
             'INSERT INTO jobs (state, kind, owner, label, hosts, mem_gb, exclusive, uses, takes_down, '
             'created_at, heartbeat_at, expect_s, command, note, mem_map, serves, serves_caps, watch, seen_at, '
-            'load, quiet, start_at, deadline, notify, expect_source, expect_n, expect_learned_s) VALUES (' + ','.join('?' * 27) + ')',
+            'load, quiet, start_at, deadline, notify, expect_source, expect_n, expect_learned_s, keepalive) '
+            'VALUES (' + ','.join('?' * 28) + ')',
             (job.state, job.kind, job.owner, job.label, json.dumps(job.hosts), job.mem_gb,
              int(job.exclusive), json.dumps(job.uses), json.dumps(job.takes_down), job.created_at,
              job.heartbeat_at, job.expect_s, job.command, job.note, json.dumps(job.mem_map),
              json.dumps(job.serves), json.dumps(job.serves_caps), int(job.watch), job.seen_at,
              json.dumps(job.load), json.dumps(job.quiet), job.start_at, job.deadline, job.notify,
-             job.expect_source, job.expect_n, job.expect_learned_s))
+             job.expect_source, job.expect_n, job.expect_learned_s, int(job.keepalive)))
         job.id = cur.lastrowid
         return job
 

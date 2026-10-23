@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix='fleetq-e2e-') as directory:
         assert result.returncode == 0, (args, result.stdout, result.stderr)
         return result
     def acquire(*args):
-        return json.loads(ok('acquire', '--host', 'fixture-a', '--label', 'isolated fixture', '--json', *args).stdout)
+        return json.loads(ok('acquire', '--host', 'fixture-a', '--label', 'isolated fixture', '--json', '--no-keepalive', *args).stdout)
     def show(job):
         return json.loads(ok('show', job['id'], '--json').stdout)
     def release(job):

@@ -1,6 +1,7 @@
 """End-to-end: real HTTP server in a thread, real CLI, fake health checks."""
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -856,3 +857,185 @@ def test_probe_loop_runs_fast_checks_between_full_ones(env, monkeypatch):
     stop.set()
     t.join(2)
     assert calls.count('full') >= 2 and calls.count('fast') >= 3
+
+
+START_KEEPALIVE = cli.start_keepalive  # conftest stubs it out for every test
+
+
+def keepalive_lease(url, label, **extra):
+    _, job = api(url, 'POST', '/v1/jobs', {'label': label, 'owner': 'o', 'hosts': ['a'], **extra})
+    api(url, 'POST', f'/v1/jobs/{job["id"]}/heartbeat', {'owner': 'o', 'keepalive': True})
+    return job
+
+
+def test_kept_alive_lease_is_released_once_its_session_is_gone(env):
+    fleet, clock, url = env
+    job = keepalive_lease(url, 'multi-step', exclusive=False)
+    assert api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]['keepalive'] is True
+    _, waiter = api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'p', 'hosts': ['a'], 'exclusive': True})
+    assert waiter['state'] == 'queued'
+    clock.t += 300
+    fleet.apply_probe({}, {}, {}, clock.t)
+    flags = api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]['flags']
+    assert any("keepalive stopped" in f and 'released as abandoned after 20m' in f for f in flags)
+    clock.t += 1000
+    fleet.apply_probe({}, {}, {}, clock.t)
+    got = api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]
+    assert got['state'] == 'cancelled' and got['note'].startswith('abandoned')
+    assert api(url, 'GET', f'/v1/jobs/{waiter["id"]}')[1]['state'] == 'running'
+    kinds = [e['kind'] for e in api(url, 'GET', '/v1/events')[1]['events'] if e['job_id'] == job['id']]
+    assert 'stale' in kinds and 'abandoned' in kinds
+
+
+def test_kept_alive_lease_that_keeps_beating_stays(env):
+    fleet, clock, url = env
+    job = keepalive_lease(url, 'long work')
+    for _ in range(60):
+        clock.t += 60
+        api(url, 'POST', f'/v1/jobs/{job["id"]}/heartbeat', {'owner': 'o', 'keepalive': True})
+        fleet.apply_probe({}, {}, {}, clock.t)
+    got = api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]
+    assert got['state'] == 'running' and not any('stale' in f or 'unclaimed' in f for f in got['flags'])
+
+
+def test_abandoned_exclusive_or_takedown_lease_is_only_flagged(env):
+    fleet, clock, url = env
+    box = keepalive_lease(url, 'reboot', exclusive=True, hosts=['b'])
+    swap = keepalive_lease(url, 'swap', takes_down=['chat-a'])
+    clock.t += 3600
+    fleet.apply_probe({}, {}, {}, clock.t)
+    for job, why in ((box, 'holds b exclusively'), (swap, 'takes down a-llm')):
+        got = api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]
+        assert got['state'] == 'running'
+        assert any(why in f and f'fleetq release {job["id"]} --force' in f for f in got['flags']), got['flags']
+
+
+def test_lease_without_keepalive_is_never_released(env):
+    fleet, clock, url = env
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'old client', 'owner': 'o', 'hosts': ['a']})
+    api(url, 'POST', f'/v1/jobs/{job["id"]}/heartbeat', {'owner': 'o'})
+    clock.t += 3600
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]['state'] == 'running'
+
+
+def test_keepalive_from_someone_else_marks_nothing(env):
+    _, _, url = env
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'mine', 'owner': 'o', 'hosts': ['a']})
+    api(url, 'POST', f'/v1/jobs/{job["id"]}/heartbeat', {'owner': 'intruder', 'keepalive': True})
+    assert api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]['keepalive'] is False
+
+
+def test_queued_kept_alive_lease_whose_session_died_is_dropped(env):
+    fleet, clock, url = env
+    api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'o', 'hosts': ['a'], 'exclusive': True})
+    job = keepalive_lease(url, 'later')
+    assert job['state'] == 'queued'
+    clock.t += 200
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]['state'] == 'cancelled'
+
+
+def test_restarted_server_gives_keepalives_time_to_come_back(env, tmp_path):
+    fleet, clock, url = env
+    job = keepalive_lease(url, 'across a restart')
+    clock.t += 7200  # the server was down for two hours
+    later = Fleet(tmp_path / 'fleet.toml', clock=clock)
+    later.step()
+    assert later.get(job['id'])['state'] == 'running'
+    clock.t += 1300
+    later.step()
+    assert later.get(job['id'])['state'] == 'cancelled'
+
+
+def test_keepalive_beats_while_its_session_lives_and_stops_when_the_lease_ends(env, monkeypatch):
+    fleet, clock, url = env
+    monkeypatch.setattr(cli, 'HEARTBEAT_S', 0.02)
+    life = {'started': 'Thu Oct 22 10:00:00 2026'}
+    monkeypatch.setattr(cli, 'proc_info', lambda pid: (1, life['started'], 'claude') if life['started'] else None)
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'kept', 'owner': 'o', 'hosts': ['a']})
+    args = cli.parser().parse_args(['--owner', 'o', '_keepalive', str(job['id']), '42', life['started']])
+    t = threading.Thread(target=cli.cmd_keepalive, args=(cli.Client(url), args), daemon=True)
+    t.start()
+    t.join(0.3)
+    assert t.is_alive() and api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]['keepalive'] is True
+    api(url, 'POST', f'/v1/jobs/{job["id"]}/release', {'owner': 'o'})
+    t.join(2)
+    assert not t.is_alive()
+    # A pid reused by a later process is not the session.
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'kept 2', 'owner': 'o', 'hosts': ['a']})
+    args = cli.parser().parse_args(['--owner', 'o', '_keepalive', str(job['id']), '42', 'Wed Oct 21 09:00:00 2026'])
+    assert cli.cmd_keepalive(cli.Client(url), args) == 0
+    assert api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]['keepalive'] is False
+
+
+def test_session_pid_follows_claude_or_nothing(monkeypatch):
+    tree = {10: (9, 'Thu', 'zsh'), 9: (8, 'Thu', '/Apps/Claude/claude'), 8: (1, 'Thu', 'Claude')}
+    monkeypatch.setattr(cli, 'proc_info', tree.get)
+    monkeypatch.setattr(cli.os, 'getppid', lambda: 10)
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+    monkeypatch.delenv('FLEETQ_KEEPALIVE_PID', raising=False)
+    assert cli.session_pid() == 9
+    monkeypatch.setenv('FLEETQ_KEEPALIVE_PID', '8')
+    assert cli.session_pid() == 8
+    monkeypatch.delenv('FLEETQ_KEEPALIVE_PID')
+    tree[9] = (8, 'Thu', 'bash')  # a harness that is not Claude Code and no terminal: no keepalive
+    monkeypatch.setattr(cli.sys, 'stdin', open(os.devnull))
+    assert cli.session_pid() is None
+
+
+def test_acquire_starts_a_detached_keepalive(env, monkeypatch):
+    _, _, url = env
+    monkeypatch.setattr(cli, 'start_keepalive', START_KEEPALIVE)
+    monkeypatch.setattr(cli, 'session_pid', lambda: 42)
+    monkeypatch.setattr(cli, 'proc_info', lambda pid: (1, 'Thu Oct 22 10:00:00 2026', 'claude'))
+    spawned = []
+    monkeypatch.setattr(cli.subprocess, 'Popen', lambda cmd, **kw: spawned.append((cmd, kw)))
+    assert cli.main(['acquire', '--host', 'a', '--label', 'x']) == 0
+    cmd, kw = spawned[0]
+    assert cmd[-4:-1] == ['_keepalive', '1', '42'] and cmd[-1] == 'Thu Oct 22 10:00:00 2026'
+    assert kw['start_new_session'] and kw['stdout'] is cli.subprocess.DEVNULL
+    assert cli.main(['acquire', '--host', 'a', '--label', 'y', '--no-keepalive']) == 0
+    assert len(spawned) == 1
+
+
+HOOKS = os.path.join(os.path.dirname(__file__), '..', 'deploy', 'claude-hooks.py')
+
+
+def run_hook(tmp_path, event, payload, owner=None):
+    fleetq = tmp_path / 'fleetq'
+    fleetq.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m fleetq.cli "$@"\n')
+    fleetq.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != 'FLEETQ_OWNER'}
+    env.update(FLEETQ_BIN=str(fleetq), **({'FLEETQ_OWNER': owner} if owner else {}))
+    out = subprocess.run([sys.executable, HOOKS, event], input=json.dumps(payload), capture_output=True,
+                         text=True, env=env, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
+def test_stop_hook_reminds_once_about_leases_others_wait_for(env, tmp_path):
+    _, _, url = env
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'bench loop', 'owner': 'claude-abcd1234-bench', 'hosts': ['a']})
+    api(url, 'POST', '/v1/jobs', {'label': 'theirs', 'owner': 'claude-other', 'hosts': ['b']})
+    assert run_hook(tmp_path, 'stop', {'session_id': 'abcd1234-5678'}) == ''  # nobody waits: no extra turn
+    api(url, 'POST', '/v1/jobs', {'label': 'next', 'owner': 'claude-other', 'hosts': ['a'], 'exclusive': True})
+    reply = json.loads(run_hook(tmp_path, 'stop', {'session_id': 'abcd1234-5678'}))
+    assert reply['decision'] == 'block'
+    assert f'#{job["id"]} "bench loop" (running 0m, 1 waiting behind it)' in reply['reason']
+    assert 'theirs' not in reply['reason']
+    assert run_hook(tmp_path, 'stop', {'session_id': 'abcd1234-5678', 'stop_hook_active': True}) == ''
+    assert run_hook(tmp_path, 'stop', {'session_id': 'ffff0000'}) == ''
+
+
+def test_session_end_hook_releases_plain_leases_only(env, tmp_path):
+    _, _, url = env
+    owner = 'claude-abcd1234'
+    _, plain = api(url, 'POST', '/v1/jobs', {'label': 'plain', 'owner': owner, 'hosts': ['a']})
+    _, task = api(url, 'POST', '/v1/jobs', {'label': 'task', 'owner': owner + '-gc', 'hosts': ['a']})
+    _, box = api(url, 'POST', '/v1/jobs', {'label': 'reboot', 'owner': owner, 'hosts': ['b'], 'exclusive': True})
+    run_hook(tmp_path, 'session-end', {'session_id': 'whatever', 'reason': 'exit'}, owner=owner)
+    for job in (plain, task):
+        got = api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]
+        assert got['state'] == 'done' and got['note'] == 'session ended (exit)'
+    assert api(url, 'GET', f'/v1/jobs/{box["id"]}')[1]['state'] == 'running'

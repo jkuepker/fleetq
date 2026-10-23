@@ -3,6 +3,9 @@
 Server address: FLEETQ_URL, else ~/.config/fleetq/url, else http://fleetq:8470.
 Token: FLEETQ_TOKEN, else ~/.config/fleetq/token.
 Owner (who may release a job): --owner, else FLEETQ_OWNER, else user@host.
+Keepalive: `fleetq acquire` starts a background process that heartbeats the lease while the
+session that took it lives (FLEETQ_KEEPALIVE_PID, else Claude Code's process, else the shell of a
+human at a terminal); once that session is gone the server releases the lease. --no-keepalive skips it.
 Nesting: `fleetq run` sets FLEETQ_JOB for its command. With FLEETQ_JOB set to a running job
 that already covers the requested host, `fleetq run` (and tools that use fleetq) run inside
 it instead of queueing behind it.
@@ -31,6 +34,7 @@ import urllib.request
 
 CONFIG_DIR = Path.home() / '.config' / 'fleetq'
 POLL_S, HEARTBEAT_S, OUTAGE_S, STOP_GRACE_S = 5, 30, 120, 30
+KEEPALIVE_GIVE_UP_S = 6 * 3600  # a keepalive stops after the server has been unreachable this long
 LONG_POLL_S = 25  # how long one GET /v1/jobs/<id>?wait=N may sit on the server
 EXIT_UNREACHABLE, EXIT_TIMEOUT, EXIT_CANCELLED = 2, 3, 4
 
@@ -773,7 +777,79 @@ def cmd_acquire(client, args):
     # With --wait this client heartbeats the queued lease; if it is killed, the server drops the lease.
     job = client.call('POST', '/v1/jobs', {**job_payload(args, 'lease'), 'watch': bool(args.wait)})
     explain_expect(job, args)
+    if not args.no_keepalive:
+        start_keepalive(client, job['id'], args.owner)
     return hold(client, args, job)
+
+
+def proc_info(pid):
+    """(parent pid, start time, command) of a live process, else None. The start time tells a
+    process apart from a later one that reuses its pid."""
+    try:
+        out = subprocess.run(['ps', '-o', 'ppid=,lstart=,comm=', '-p', str(pid)], capture_output=True, text=True,
+                             timeout=5, env={**os.environ, 'LC_ALL': 'C'}).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if len(out) < 7 or not out[0].isdigit():
+        return None
+    return int(out[0]), ' '.join(out[1:6]), ' '.join(out[6:])
+
+
+def session_pid():
+    """The long-lived process a lease's keepalive follows: FLEETQ_KEEPALIVE_PID, else Claude Code's
+    (CLAUDE_PID, or the nearest ancestor named claude), else the shell of a human at a terminal.
+    None if there is none: following a parent that exits with this command would abandon the lease."""
+    for var in ('FLEETQ_KEEPALIVE_PID', 'CLAUDE_PID'):
+        value = os.environ.get(var, '')
+        if value.isdigit() and proc_info(int(value)):
+            return int(value)
+    pid = os.getppid()
+    for _ in range(16):
+        info = proc_info(pid)
+        if not info:
+            break
+        if os.path.basename(info[2]) == 'claude':
+            return pid
+        if info[0] <= 1:
+            break
+        pid = info[0]
+    return os.getppid() if sys.stdin.isatty() else None
+
+
+def start_keepalive(client, job_id, owner):
+    """Heartbeat the lease from a detached process for as long as its session lives."""
+    pid = session_pid()
+    info = pid and proc_info(pid)
+    if not info:
+        say(f'no long-lived session process found, so #{job_id} has no keepalive: release it yourself')
+        return
+    try:
+        subprocess.Popen([sys.executable, '-m', 'fleetq.cli', '--url', client.url, '--owner', owner,
+                          '_keepalive', str(job_id), str(pid), info[1]],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True, cwd='/')
+    except OSError as exc:
+        say(f'could not start the keepalive for #{job_id} ({exc}): release it yourself')
+
+
+def cmd_keepalive(client, args):
+    """Heartbeat lease args.id every HEARTBEAT_S while process args.pid, started at args.started,
+    lives; stop once the lease has ended. The server releases the lease when the beats stop."""
+    reached = time.time()
+    while (proc_info(args.pid) or (0, None))[1] == args.started:
+        try:
+            job = client.call('POST', f'/v1/jobs/{args.id}/heartbeat', {'owner': args.owner, 'keepalive': True})
+            if job['state'] not in ('queued', 'running'):
+                return 0
+            reached = time.time()
+        except ApiError as exc:
+            if exc.code == 404:
+                return 0
+        except Unreachable:
+            if time.time() - reached > KEEPALIVE_GIVE_UP_S:
+                return 0  # the server is gone for good (a test server, a decommissioned URL)
+        time.sleep(HEARTBEAT_S)
+    return 0
 
 
 def cmd_reserve(client, args):
@@ -1272,8 +1348,17 @@ def parser():
                         '"auto": take the learned estimate as given (needs 5 similar runs)')
     p.add_argument('--wait', action='store_true', help='block until the slot is granted')
     p.add_argument('--wait-timeout', type=float, help='minutes to wait (with --wait)')
+    p.add_argument('--no-keepalive', action='store_true',
+                   help='do not heartbeat the lease while this session lives (it is then never released '
+                        'for you, even after the session is gone)')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_acquire)
+
+    p = sub.add_parser('_keepalive')  # started by acquire; not listed in help
+    p.add_argument('id', type=int)
+    p.add_argument('pid', type=int)
+    p.add_argument('started')
+    p.set_defaults(fn=cmd_keepalive)
 
     p = sub.add_parser('reserve', help='book a slot for later; others use the box until then')
     add_job_args(p)
