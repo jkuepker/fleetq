@@ -1039,3 +1039,21 @@ def test_session_end_hook_releases_plain_leases_only(env, tmp_path):
         got = api(url, 'GET', f'/v1/jobs/{job["id"]}')[1]
         assert got['state'] == 'done' and got['note'] == 'session ended (exit)'
     assert api(url, 'GET', f'/v1/jobs/{box["id"]}')[1]['state'] == 'running'
+
+
+def test_kept_alive_run_job_is_released_once_its_client_is_gone(env):
+    # A service such as Mission Control submits run jobs and does the work itself: once its
+    # heartbeats stop, the work stopped too. A plain run job (fleetq run) is only flagged.
+    fleet, clock, url = env
+    _, kept = api(url, 'POST', '/v1/jobs', {'kind': 'run', 'label': 'mission segment', 'owner': 'o', 'hosts': ['a']})
+    _, plain = api(url, 'POST', '/v1/jobs', {'kind': 'run', 'label': 'cli run', 'owner': 'o', 'hosts': ['b']})
+    api(url, 'POST', f'/v1/jobs/{kept["id"]}/heartbeat', {'owner': 'o', 'keepalive': True})
+    assert api(url, 'GET', f'/v1/jobs/{kept["id"]}')[1]['keepalive'] is True
+    clock.t += 300
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert any('released as abandoned' in f for f in api(url, 'GET', f'/v1/jobs/{kept["id"]}')[1]['flags'])
+    assert any('the work may still be running' in f for f in api(url, 'GET', f'/v1/jobs/{plain["id"]}')[1]['flags'])
+    clock.t += 1000
+    fleet.apply_probe({}, {}, {}, clock.t)
+    assert api(url, 'GET', f'/v1/jobs/{kept["id"]}')[1]['state'] == 'cancelled'
+    assert api(url, 'GET', f'/v1/jobs/{plain["id"]}')[1]['state'] == 'running'

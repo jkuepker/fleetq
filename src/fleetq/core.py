@@ -125,7 +125,7 @@ class Job:
     expect_source: str = ''              # given | learned | default; '' (older rows): given if expect_s is set
     expect_n: int = 0                    # learned: how many finished jobs it comes from
     expect_learned_s: float | None = None  # learned: the server's estimate; expect_s stays the stated one or None
-    keepalive: bool = False              # leases: a keepalive process heartbeats it while its session lives
+    keepalive: bool = False              # released once its heartbeats stop (a lease's keepalive, Mission Control)
 
     def __post_init__(self):
         if not self.expect_source:

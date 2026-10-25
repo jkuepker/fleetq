@@ -178,7 +178,7 @@ services are listed. The README's "Find a model to use" section covers the detai
 | Route | Body | Does |
 |---|---|---|
 | `POST /v1/jobs` | job request (below) | queues a job and answers with it; starts it at once if it fits |
-| `POST /v1/jobs/<id>/heartbeat` | `{"owner"?, "keepalive"?}` | keeps a `run` job, a watched lease or a kept-alive lease from being flagged stale or dropped; `"keepalive": true` from a lease's owner makes it kept alive (below) |
+| `POST /v1/jobs/<id>/heartbeat` | `{"owner"?, "keepalive"?}` | keeps a `run` job, a watched lease or a kept-alive job from being flagged stale or dropped; `"keepalive": true` from the job's owner makes it kept alive (below) |
 | `POST /v1/jobs/<id>/unwatch` | none | the waiting client stops on purpose: the lease stays queued without heartbeats |
 | `POST /v1/jobs/<id>/release` | `{"owner", "note"?, "exit_code"?, "force"?}` | finishes a running job or cancels a queued one; only the owner may, unless `force` |
 | `POST /v1/jobs/<id>/update` | `{"owner", "load"?, "quiet"?, "mem_gb"?, "mem_map"?, "force"?}` | lowers a queued or running job's claims at once; raising one answers `409` (queue a new job instead) |
@@ -317,11 +317,12 @@ is flagged `unclaimed` and logged once; the next contact clears the flag, and fl
 releases it. With `"watch": true`, heartbeat at least every 180 s (`stale_heartbeat_s`) while
 queued, and call `unwatch` before you stop waiting if the lease should keep its place.
 
-A lease becomes kept alive with its owner's first heartbeat carrying `"keepalive": true` (the
-job then shows `"keepalive": true`). From then on it must keep heartbeating: queued, it is dropped
+A job (a lease, or a `run` job whose work lives and dies with the client that submitted it)
+becomes kept alive with its owner's first heartbeat carrying `"keepalive": true` (the job then
+shows `"keepalive": true`). `fleetq run` never sends it, since its command may outlive the client. From then on it must keep heartbeating: queued, it is dropped
 after `stale_heartbeat_s` of silence (`abandoned`); running, it is flagged `stale` after
 `stale_heartbeat_s` and released after `abandon_after_s` (server config, default 1200 s) as
-`cancelled` with an `abandoned` event. An `exclusive` or `takes_down` lease is flagged but never
+`cancelled` with an `abandoned` event. An `exclusive` or `takes_down` job is flagged but never
 released. Silence is counted from the later of the last heartbeat and the server's own start, so a
 server back from downtime gives clients time to reach it first. A harness
 that only sends requests to an existing server should hold a shared lease with `uses` on
