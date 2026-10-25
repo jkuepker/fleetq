@@ -514,10 +514,13 @@ class Stopper:
 
 class Deadline:
     """When a job that started ahead of the line must end, on this machine's clock. The server
-    sends it relative (deadline_in_s); heartbeat answers keep it current."""
+    sends it relative (deadline_in_s); heartbeat answers keep it current.
+
+    lost: why the job no longer holds its slot (released or cancelled while its command runs),
+    set by the thread that watches the job; the command is stopped at once then."""
 
     def __init__(self, job=None):
-        self.at, self.hit = None, False
+        self.at, self.hit, self.lost, self.stopped = None, False, None, False
         if job:
             self.update(job)
 
@@ -528,14 +531,18 @@ class Deadline:
         self.at = time.time() + left if left is not None else None
 
     def check(self, stopper):
-        """Stop the processes once the deadline passes; returns whether it has."""
-        if not self.hit and self.at is not None and time.time() >= self.at:
-            self.hit = True
+        """Stop the processes once the deadline passes or the slot is lost; returns whether they were."""
+        if not self.stopped and self.lost:
+            say(f'{self.lost}: stopping the command (SIGTERM, SIGKILL after {STOP_GRACE_S}s)')
+            self.stopped = True
+            stopper.stop()
+        elif not self.stopped and self.at is not None and time.time() >= self.at:
+            self.hit = self.stopped = True
             say(f'deadline reached: stopping the command (SIGTERM, SIGKILL after {STOP_GRACE_S}s) so the '
                 'job it went ahead of can start')
             stopper.stop()
         stopper.tick()
-        return self.hit
+        return self.stopped
 
 
 def grouped(deadline):
@@ -740,16 +747,46 @@ def cmd_run(client, args):
             f'(by {local_time(started["deadline_in_s"])}); it is stopped then')
     stop = threading.Event()
 
-    def beat():
-        while not stop.wait(HEARTBEAT_S):
+    def watch():
+        """Heartbeat, and between heartbeats long-poll the job, which answers as soon as it stops
+        running: released or cancelled by someone else, the command must not keep the slot it lost."""
+        last_beat, long_poll, failing = time.time(), True, False
+        while not stop.is_set():
             try:
-                deadline.update(client.call('POST', f'/v1/jobs/{job["id"]}/heartbeat', {'owner': args.owner}))
+                if time.time() - last_beat >= HEARTBEAT_S:
+                    now = client.call('POST', f'/v1/jobs/{job["id"]}/heartbeat', {'owner': args.owner})
+                    last_beat = time.time()
+                elif long_poll:
+                    wait = max(min(LONG_POLL_S, last_beat + HEARTBEAT_S - time.time()), 0.0)
+                    now = client.call('GET', job_path(job['id'], args.owner, wait=f'{wait:.2f}', state='running'),
+                                      timeout=wait + client.timeout)
+                    long_poll = 'waited' in now  # an old server answers at once; poll it instead
+                else:
+                    if stop.wait(POLL_S):
+                        return
+                    now = client.call('GET', job_path(job['id'], args.owner))
+                failing = False
             except (Unreachable, ApiError) as exc:
-                say(f'heartbeat for #{job["id"]} failed ({exc}); the command keeps running')
+                if not failing:
+                    say(f'checking on #{job["id"]} failed ({exc}); the command keeps running')
+                failing = True
+                stop.wait(POLL_S)
+                continue
+            deadline.update(now)
+            if now['state'] != 'running':
+                note = f' ({now["note"]})' if now.get('note') else ''
+                deadline.lost = (f'#{job["id"]} was released while its command ran (now {now["state"]}{note}), '
+                                 'so it holds no slot')
+                return
 
-    threading.Thread(target=beat, daemon=True).start()
+    threading.Thread(target=watch, daemon=True).start()
     code = execute(client, args, started['hosts'], {**os.environ, 'FLEETQ_JOB': str(job['id'])}, deadline)
     stop.set()
+    if deadline.lost:
+        remote = ('; a command run over ssh may still be running on the remote side: check and stop it there'
+                  if os.path.basename(args.command[0]) == 'ssh' else '')
+        say(f'#{job["id"]} stopped (exit {code}): {deadline.lost}{remote}')
+        return EXIT_CANCELLED
     if deadline.hit:
         say(f'#{job["id"]} was stopped at its deadline (exit {code}); next time give a longer --expect, '
             'or queue it without one to wait its turn')

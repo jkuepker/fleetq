@@ -291,7 +291,9 @@ exits 0 when `FLEETQ_JOB` covers X.
 Exit codes: `run` returns the command's code; 2 = server unreachable (nothing started;
 `--no-queue` runs anyway; it does not skip the line); 3 = gave up waiting (`--wait-timeout`); 4 = the job was released
 or cancelled before it started (`fleetq release` on a queued job, or the server dropped it), so
-the command never ran. `acquire --wait` also returns 4 then.
+the command never ran, or released while its command ran (by someone else, e.g. `fleetq release`
+moments after the job got its slot), so fleetq stopped the command at once (SIGTERM, SIGKILL after
+30 s; over ssh the remote side may outlive it). `acquire --wait` also returns 4 when its lease leaves the queue.
 
 ## Rules
 
