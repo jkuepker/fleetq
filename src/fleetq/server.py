@@ -135,7 +135,7 @@ class Fleet:
     def _flags(self, job, now, ctx=None):
         ctx = ctx or self._context(now)
         flags = []
-        if self._stale(job, now) and job.kind == 'run':
+        if self._stale(job, now) and not job.keepalive:
             flags.append(f'stale: no heartbeat for {human(now - job.heartbeat_at)}; '
                          'the client may be gone, the work may still be running')
         elif self._stale(job, now):
@@ -172,7 +172,7 @@ class Fleet:
         return flags
 
     def _stale(self, job, now):
-        """A running job whose heartbeats stopped: a run job's client, or a lease's keepalive."""
+        """A running job whose heartbeats stopped: a run job's client, or a kept-alive job's keepalive."""
         return (job.state == RUNNING and (job.kind == 'run' or job.keepalive) and job.heartbeat_at is not None
                 and self._silent_s(job, now) > self.cfg['stale_heartbeat_s'])
 
@@ -182,8 +182,8 @@ class Fleet:
         return now - max(job.heartbeat_at, self.started_at)
 
     def _abandoned(self, job, now):
-        """A kept-alive lease whose session has been gone for abandon_after_s."""
-        return (self._stale(job, now) and job.kind == 'lease'
+        """A kept-alive job whose session has been gone for abandon_after_s."""
+        return (self._stale(job, now) and job.keepalive
                 and self._silent_s(job, now) > self.cfg['abandon_after_s'])
 
     @staticmethod
@@ -322,7 +322,7 @@ class Fleet:
                 continue
             if self._stale(job, now) and not self.store.has_event_since('stale', job.heartbeat_at, job.id):
                 held = self._held_why(job)
-                then = ('' if job.kind == 'run' else f'; it {held}, so fleetq will not release it' if held
+                then = ('' if not job.keepalive else f'; it {held}, so fleetq will not release it' if held
                         else f'; released after {human(self.cfg["abandon_after_s"])} unless it comes back')
                 self.store.event(now, 'stale', f'#{job.id} has sent no heartbeat for '
                                  f'{human(now - job.heartbeat_at)}; its client may be gone{then}: {job.label}', job.id)
@@ -697,14 +697,16 @@ class Fleet:
     def heartbeat(self, job_id, owner=None, keepalive=False):
         """A client is still there. One that names an owner other than the job's keeps nothing
         alive and claims nothing; one that names none (older clients) counts as the owner. keepalive:
-        sent by a lease's keepalive process, after which the lease ends when its heartbeats stop."""
+        sent by a client that holds the job only as long as it lives (a lease's keepalive process, or a
+        service such as Mission Control that runs its own work under the slot), after which the job is
+        released when its heartbeats stop. `fleetq run` never sends it: its command may outlive the client."""
         with self.lock, self.store.transaction():
             job = self.store.job(job_id)
             if not job:
                 raise ApiError(404, f'no job #{job_id}')
             if job.state in (QUEUED, RUNNING) and (owner is None or owner == job.owner):
                 now = self.clock()
-                extra = {'keepalive': 1} if keepalive and job.kind == 'lease' else {}
+                extra = {'keepalive': 1} if keepalive else {}
                 self.store.update_job(job_id, heartbeat_at=now, seen_at=now, **extra)
             return self.get(job_id)
 
