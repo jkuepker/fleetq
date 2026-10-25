@@ -445,13 +445,14 @@ def test_status_can_show_several_hosts(env):
     assert 'a (ma)' not in one and 'b (mb)' in one
 
 
-def start_queued_run(url, marker, extra=()):
-    """Hold host a with someone else's lease and queue a `run` behind it; returns (thread, result, job id)."""
+def start_queued_run(url, marker, extra=(), before=''):
+    """Hold host a with someone else's lease and queue a `run` behind it; returns (thread, result, job id).
+    The run's command writes marker, after the Python in before."""
     api(url, 'POST', '/v1/jobs', {'label': 'hold', 'owner': 'other', 'hosts': ['a'], 'exclusive': True})
     result = {}
     t = threading.Thread(target=lambda: result.update(code=cli.main(
         ['run', '--host', 'a', '--exclusive', '--label', 'behind', *extra, '--',
-         sys.executable, '-c', f'open({str(marker)!r}, "w").close()'])))
+         sys.executable, '-c', f'{before}open({str(marker)!r}, "w").close()'])))
     t.start()
     for _ in range(100):
         queued = api(url, 'GET', '/v1/status')[1]['hosts'][0]['queued']
@@ -498,6 +499,46 @@ def test_run_rechecks_its_slot_right_before_starting(env, tmp_path, monkeypatch)
     code = cli.main(['run', '--host', 'b', '--label', 'x', '--', sys.executable, '-c',
                      f'open({str(marker)!r}, "w").close()'])
     assert code == cli.EXIT_CANCELLED and not marker.exists()
+
+
+def holder_of(url, host):
+    return next(j['id'] for h in api(url, 'GET', '/v1/status')[1]['hosts'] if h['name'] == host
+                for j in h['running'])
+
+
+def test_released_queued_run_never_runs_once_the_slot_frees(env, tmp_path):
+    _, _, url = env
+    marker = tmp_path / 'ran'
+    t, result, job_id = start_queued_run(url, marker)
+    hold = holder_of(url, 'a')
+    assert api(url, 'POST', f'/v1/jobs/{job_id}/release', {'owner': 'tester'})[1]['state'] == 'cancelled'
+    assert api(url, 'POST', f'/v1/jobs/{hold}/release', {'owner': 'other'})[0] == 200
+    t.join(5)
+    assert not t.is_alive() and result['code'] == cli.EXIT_CANCELLED
+    time.sleep(0.3)
+    assert not marker.exists()
+
+
+def test_run_released_just_after_it_started_stops_its_command(env, tmp_path, capsys):
+    """#5288: releasing the job ahead started this one; releasing this one a moment later (its
+    client had already passed the check before exec) left the command running outside any slot."""
+    _, _, url = env
+    marker, started = tmp_path / 'ran', tmp_path / 'started'
+    t, result, job_id = start_queued_run(
+        url, marker, before=f'import time; open({str(started)!r}, "w").close(); time.sleep(3); ')
+    assert api(url, 'POST', f'/v1/jobs/{holder_of(url, "a")}/release', {'owner': 'other'})[0] == 200
+    for _ in range(250):
+        if started.exists():
+            break
+        time.sleep(0.02)
+    assert started.exists(), 'the run never started its command'
+    t0 = time.monotonic()
+    assert api(url, 'POST', f'/v1/jobs/{job_id}/release', {'owner': 'tester'})[1]['state'] == 'done'
+    t.join(5)
+    assert not t.is_alive() and result['code'] == cli.EXIT_CANCELLED
+    assert time.monotonic() - t0 < 2
+    assert not marker.exists()
+    assert f'#{job_id} was released while its command ran' in capsys.readouterr().err
 
 
 def test_acquire_wait_reports_a_cancelled_lease(env, monkeypatch):
