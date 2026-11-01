@@ -1,0 +1,51 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "fleetq",
+  "title": "Fleetq",
+  "description": "Show the GPU fleet, the running job on each box and how many jobs are queued.",
+  "icon": "icon.png",
+  "author": "josef",
+  "license": "MIT",
+  "categories": ["Developer Tools"],
+  "commands": [
+    {
+      "name": "fleet-status",
+      "title": "Fleet Status",
+      "subtitle": "fleetq",
+      "description": "Current fleet, running job per box and queue length.",
+      "mode": "view"
+    },
+    {
+      "name": "fleet-menu-bar",
+      "title": "Fleet Queue in Menu Bar",
+      "subtitle": "fleetq",
+      "description": "Running and queued job counts in the menu bar, refreshed every minute.",
+      "mode": "menu-bar",
+      "interval": "1m"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "fleetqPath",
+      "title": "fleetq Path",
+      "description": "Path to the fleetq CLI. Raycast does not load your shell PATH.",
+      "type": "textfield",
+      "required": false,
+      "default": "~/.local/bin/fleetq"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.93.0",
+    "@raycast/utils": "^1.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "build": "ray build -e dist",
+    "dev": "ray develop",
+    "typecheck": "tsc --noEmit"
+  }
+}
