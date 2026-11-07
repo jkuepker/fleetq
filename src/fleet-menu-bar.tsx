@@ -1,5 +1,5 @@
 import { Clipboard, Color, Icon, launchCommand, LaunchType, MenuBarExtra } from "@raycast/api";
-import { hostLine, Job, summarize, useFleetStatus } from "./fleet";
+import { elapsed, hostLine, Job, jobTitle, overdue, summarize, useFleetStatus } from "./fleet";
 
 // Menu titles are plain strings (no font or color), so bold comes from Unicode
 // Mathematical Sans-Serif Bold letters and digits; status color goes on the icon.
@@ -13,11 +13,13 @@ function bold(text: string): string {
     .join("");
 }
 
-function JobItem({ job }: { job: Job }) {
+function JobItem({ job, now }: { job: Job; now: number }) {
+  const tint = job.state !== "running" ? Color.Blue : overdue(job, now) ? Color.Red : Color.Yellow;
   return (
     <MenuBarExtra.Item
-      icon={{ source: Icon.Tag, tintColor: job.state === "running" ? Color.Yellow : Color.Blue }}
-      title={`${job.hosts.map(bold).join(" + ")}   #${job.id} ${job.label}`}
+      icon={{ source: Icon.Tag, tintColor: tint }}
+      title={`${job.hosts.map(bold).join(" + ")}   ${jobTitle(job)}`}
+      subtitle={elapsed(job, now) || undefined}
       tooltip="Copy job ID"
       onAction={() => Clipboard.copy(String(job.id))}
     />
@@ -56,14 +58,14 @@ export default function Command() {
       {running.length > 0 && (
         <MenuBarExtra.Section title="Running">
           {running.map((job) => (
-            <JobItem key={job.id} job={job} />
+            <JobItem key={job.id} job={job} now={now} />
           ))}
         </MenuBarExtra.Section>
       )}
       {queued.length > 0 && (
         <MenuBarExtra.Section title={`Queued (${queued.length})`}>
           {queued.map((job) => (
-            <JobItem key={job.id} job={job} />
+            <JobItem key={job.id} job={job} now={now} />
           ))}
         </MenuBarExtra.Section>
       )}

@@ -59,10 +59,24 @@ export function summarize(status: Status | undefined) {
   return { hosts, running, queued, idle: running.length === 0 && queued.length === 0 };
 }
 
-export function jobLine(job: Job, now: number): string {
-  const ran = job.started_at ? duration(now - job.started_at) : "";
+export function jobTitle(job: Job): string {
+  return `#${job.id} ${job.label}`;
+}
+
+// fleetq has no elapsed field: it is now - started_at, as `fleetq status` prints "for 22m".
+export function elapsed(job: Job, now: number): string {
+  if (!job.started_at) return "";
   const expect = job.expect_s ? ` of ~${duration(job.expect_s)}` : "";
-  return `#${job.id} ${job.label}${ran ? ` · ${ran}${expect}` : ""}`;
+  return `${duration(now - job.started_at)}${expect}`;
+}
+
+export function overdue(job: Job, now: number): boolean {
+  return !!job.started_at && !!job.expect_s && now - job.started_at > job.expect_s;
+}
+
+export function jobLine(job: Job, now: number): string {
+  const ran = elapsed(job, now);
+  return `${jobTitle(job)}${ran ? ` · ${ran}` : ""}`;
 }
 
 export function hostLine(host: Host, now: number): string {

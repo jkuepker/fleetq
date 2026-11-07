@@ -1,5 +1,5 @@
 import { Action, ActionPanel, Color, Icon, List } from "@raycast/api";
-import { hostLine, summarize, useFleetStatus } from "./fleet";
+import { elapsed, hostLine, jobTitle, overdue, summarize, useFleetStatus } from "./fleet";
 
 export default function Command() {
   const { data, isLoading, error, revalidate } = useFleetStatus();
@@ -36,7 +36,7 @@ export default function Command() {
           <List.Item
             icon={idle ? { source: Icon.CheckCircle, tintColor: Color.Green } : Icon.List}
             title={idle ? "Empty queue" : `${running.length} running · ${queued.length} queued`}
-            subtitle={idle ? "Fleet is idle" : running.map((j) => `#${j.id} ${j.label}`).join("  ·  ")}
+            subtitle={idle ? "Fleet is idle" : running.map(jobTitle).join("  ·  ")}
             actions={<ActionPanel>{refresh}</ActionPanel>}
           />
         </List.Section>
@@ -46,6 +46,15 @@ export default function Command() {
           const job = host.running[0];
           const offline = host.online === false;
           const accessories: List.Item.Accessory[] = [];
+          // Elapsed time is its own accessory: at the end of the subtitle a long label cut it off.
+          const ran = job ? elapsed(job, now) : "";
+          if (job && ran) {
+            accessories.push({
+              icon: Icon.Clock,
+              text: { value: ran, color: overdue(job, now) ? Color.Red : undefined },
+              tooltip: overdue(job, now) ? "Running longer than its --expect" : "Running for",
+            });
+          }
           if (host.queued.length > 0) {
             accessories.push({ tag: { value: `${host.queued.length} queued`, color: Color.Orange } });
           }
@@ -66,7 +75,7 @@ export default function Command() {
                 tintColor: offline ? Color.Red : job ? Color.Yellow : Color.Green,
               }}
               title={host.name}
-              subtitle={hostLine(host, now)}
+              subtitle={job ? jobTitle(job) : hostLine(host, now)}
               keywords={[host.machine, ...host.running.map((j) => j.label)]}
               accessories={accessories}
               actions={
