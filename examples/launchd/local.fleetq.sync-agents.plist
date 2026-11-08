@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps Pi, omp and OpenCode in step with the fleet: `fleetq sync-agents` every 60 s.
+  Replace /Users/you with your home folder (launchd does not expand ~ or $HOME), then:
+    mkdir -p ~/.local/state/fleetq
+    cp local.fleetq.sync-agents.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.fleetq.sync-agents.plist
+  Remove: launchctl bootout gui/$(id -u)/local.fleetq.sync-agents
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.fleetq.sync-agents</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.local/bin/fleetq</string>
+    <string>sync-agents</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/you/.local/state/fleetq/sync-agents.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/.local/state/fleetq/sync-agents.log</string>
+</dict>
+</plist>
