@@ -2,7 +2,7 @@
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "fleetq",
   "title": "Fleetq",
-  "description": "Show the GPU fleet, the running job on each box and how many jobs are queued.",
+  "description": "Show the GPU fleet, the running job on each box, how many jobs are queued, and the models it serves.",
   "icon": "icon.png",
   "author": "josef",
   "license": "MIT",
@@ -22,16 +22,29 @@
       "description": "Running and queued job counts in the menu bar, refreshed every minute.",
       "mode": "menu-bar",
       "interval": "1m"
+    },
+    {
+      "name": "fleet-models",
+      "title": "Fleet Models",
+      "subtitle": "fleetq",
+      "description": "Every model the fleet serves, with its URL and the name fleetq sync-agents gives it in Pi, omp and OpenCode.",
+      "mode": "view"
     }
   ],
   "preferences": [
     {
-      "name": "fleetqPath",
-      "title": "fleetq Path",
-      "description": "Path to the fleetq CLI. Raycast does not load your shell PATH.",
+      "name": "serverUrl",
+      "title": "Server URL",
+      "description": "fleetq server. Empty: ~/.config/fleetq/url, else http://fleetq:8470. Reads with ~/.config/fleetq/readonly_token.",
       "type": "textfield",
-      "required": false,
-      "default": "~/.local/bin/fleetq"
+      "required": false
+    },
+    {
+      "name": "owners",
+      "title": "Your Owner Names",
+      "description": "Jobs to mark as yours, comma-separated; * matches anything (e.g. you@laptop, claude-*). Empty: user@host, the CLI's default.",
+      "type": "textfield",
+      "required": false
     }
   ],
   "dependencies": {
