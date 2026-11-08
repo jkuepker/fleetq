@@ -1041,6 +1041,26 @@ def cmd_models(client, args):
     return 0
 
 
+def cmd_sync_agents(client, args):
+    """Write the fleet's usable models into Pi, omp and OpenCode; quiet when nothing changed."""
+    from fleetq import agents
+    only = split_list(args.only) or list(agents.HARNESSES)
+    unknown = [h for h in only if h not in agents.HARNESSES]
+    if unknown:
+        say(f'unknown harness {", ".join(unknown)}; choose from {", ".join(agents.HARNESSES)}')
+        return 1
+    token = setting('FLEETQ_READONLY_TOKEN', 'readonly_token')
+    if not token:
+        say(f'sync-agents reads with the read-only token: set FLEETQ_READONLY_TOKEN or write {CONFIG_DIR / "readonly_token"}')
+        return 1
+    r = Client(client.url, token=token).call('GET', '/v1/models?all=1')
+    models = r.get('models') if isinstance(r, dict) else None
+    if not isinstance(models, list):
+        say('fleetq server sent no model list; nothing changed')
+        return 1
+    return agents.sync(models, only, include_all=args.all, dry_run=args.dry_run)
+
+
 def render_models(models):
     """One line per (url, model): usable mark, model, capabilities, context, where it runs."""
     if not models:
@@ -1427,6 +1447,12 @@ def parser():
     p.add_argument('--all', action='store_true', help='also models that are down, held or starting')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_models)
+
+    p = sub.add_parser('sync-agents', help='write the fleet\'s models into Pi, omp and OpenCode configs')
+    p.add_argument('--dry-run', action='store_true', help='print the diff (secrets redacted), write nothing')
+    p.add_argument('--only', action='append', help='only these harnesses: pi,omp,opencode')
+    p.add_argument('--all', action='store_true', help='also models that are not usable right now')
+    p.set_defaults(fn=cmd_sync_agents)
 
     p = sub.add_parser('log', help='recent queue events')
     p.add_argument('--limit', type=int, default=30)

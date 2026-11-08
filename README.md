@@ -86,6 +86,43 @@ fleetq acquire --host gpu-b --mem 40 --serves http://gpu-b:8001/v1 --caps text,i
   --label "try GLM 5.3V" --expect 90 --wait
 ```
 
+### Put the fleet's models in your agent harnesses
+
+```bash
+fleetq sync-agents --dry-run   # the diff it would write, secrets shown as <redacted>
+fleetq sync-agents             # write it; silent when nothing changed
+```
+
+`sync-agents` writes the usable models into Pi
+(`~/.pi/agent/models.json`), omp (`~/.omp/agent/models.yml`) and
+[OpenCode](https://opencode.ai) (`~/.config/opencode/opencode.json`), so every front end
+that drives them lists the fleet's models. `--only pi,omp,opencode` limits it to some of
+them, `--all` also writes models that are not usable right now. It reads `/v1/models` with
+the read-only token (`FLEETQ_READONLY_TOKEN`, else `~/.config/fleetq/readonly_token`) and
+never uses the full one. It takes no fleet slot: it only reads the queue server.
+
+- **One provider per URL**, named `fleetq-<host>-<port>`; the names one URL serves for the
+  same `root` are aliases and become one model, listed under the first name. Each model gets
+  its `context` and an output limit of a quarter of it (at most 32K), and image input when
+  its capabilities say `image`: the harnesses' own defaults (128K to 200K context, output as
+  large as the context) make a 32K vLLM server answer 400. A model with no known `context`
+  gets the harness default.
+- **Only `fleetq-*` providers are touched.** In the JSON files every other byte stays as it
+  is; omp gets a block between two marker comments inside `providers:`, and a layout that
+  makes that unsafe (flow style, tabs, a hand-made `fleetq-*` key) is reported and left alone.
+  OpenCode 1.18 reads only the legacy `provider` key, so that is the one written; names
+  already defined in `opencode.jsonc` are left to it. `--dry-run` also lists hand-made
+  providers that point at a fleet machine.
+- **Safe to run often.** Each write goes to a temp file and is renamed into place with the
+  file's mode, the previous version is kept as `<file>.fleetq-bak`, and a file the harness
+  changed during the run is skipped until the next one. If the server cannot be reached,
+  nothing is written. `PI_CODING_AGENT_DIR` (Pi and omp) and `XDG_CONFIG_HOME` (OpenCode)
+  move the files, as they do for the harnesses.
+
+To keep them in step, run it every minute:
+[`examples/launchd/local.fleetq.sync-agents.plist`](examples/launchd/local.fleetq.sync-agents.plist)
+on macOS, or a cron or systemd timer running `fleetq sync-agents` elsewhere.
+
 ## Run work
 
 A benchmark or any single command: wait for a slot, run, release on exit (even on a crash).
@@ -402,7 +439,8 @@ URL is never shown by the API (an ntfy topic is a secret).
   with a covering `FLEETQ_JOB`. Give each agent session its own owner name.
   [`examples/claude-code/`](examples/claude-code/) is a ready-made hook that reads the boxes
   from `fleetq roster`.
-- **Agent harnesses** pick a model with `GET /v1/models` and hold a shared lease (`--uses`)
+- **Agent harnesses** list the fleet's models through `fleetq sync-agents`, or pick one with
+  `GET /v1/models`, and hold a shared lease (`--uses`)
   on the service they send requests to, so nobody takes it down mid-run.
 - **Dashboards and status bars** read `GET /v1/status` with the read-only token.
 
