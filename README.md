@@ -443,6 +443,8 @@ URL is never shown by the API (an ntfy topic is a secret).
   `GET /v1/models`, and hold a shared lease (`--uses`)
   on the service they send requests to, so nobody takes it down mid-run.
 - **Dashboards and status bars** read `GET /v1/status` with the read-only token.
+  [`examples/raycast/`](examples/raycast/) is a Raycast command and macOS menu bar item that
+  shows each box's running job and queue.
 
 ## Change the roster
 
