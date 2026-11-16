@@ -291,6 +291,18 @@ def test_untracked_memory_and_busy_gpu_are_reported(env):
     assert job['state'] == 'queued' and 'GPU is 90% busy' in job['reason']
 
 
+def test_memory_an_exclusive_job_fills_is_not_reported_as_untracked(env):
+    fleet, clock, url = env
+    _, job = api(url, 'POST', '/v1/jobs', {'label': 'bench', 'owner': 'o', 'hosts': ['a'], 'exclusive': True})
+    assert job['state'] == 'running'
+    fleet.apply_probe({}, {}, {'a': {'free_gib': 0.1, 'util': 1.0}}, clock.t)
+    status = api(url, 'GET', '/v1/status')[1]
+    assert not any('does not track' in w or 'busy with no fleetq job' in w for w in status['warnings'])
+    api(url, 'POST', f'/v1/jobs/{job["id"]}/release', {'owner': 'o'})
+    status = api(url, 'GET', '/v1/status')[1]
+    assert any('in use that fleetq does not track' in w for w in status['warnings'])
+
+
 def test_for_url_resolves_and_off_fleet_urls_run_without_a_slot(env, capsys):
     _, _, url = env
     code, body = api(url, 'POST', '/v1/resolve', {'for_url': 'http://ma:8000/v1'})

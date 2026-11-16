@@ -874,7 +874,9 @@ class Fleet:
                                  'note': s.note})
                     if st.warn:
                         warnings.append(f'{s.name} on {name}: {st.text}')
-                if name in actual and free - actual[name] > self.cfg['untracked_gb_warn']:
+                # An exclusive job owns the box, so the memory it fills is its own, even with no --mem.
+                held = any(j.exclusive and name in j.hosts for j in running)
+                if name in actual and not held and free - actual[name] > self.cfg['untracked_gb_warn']:
                     warnings.append(f'{name}: about {free - actual[name]:.0f} GB in use that fleetq does not '
                                     f'track (box reports {actual[name]:.0f} GB free, fleetq expects {free:g})')
                 if name in util and util[name] > 0.25 and not any(name in j.hosts for j in running):

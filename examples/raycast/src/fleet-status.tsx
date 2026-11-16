@@ -6,6 +6,7 @@ import {
   isMine,
   jobTitle,
   overdue,
+  settled,
   summarize,
   TOKEN_HELP,
   useFleetStatus,
@@ -117,7 +118,7 @@ export default function Command() {
           const job = host.running[0];
           const offline = host.online === false;
           const bad = offline || host.services.some((s) => s.warn);
-          const odd = host.services.some((s) => s.status !== "up");
+          const odd = host.services.some((s) => !settled(s));
           const accessories: List.Item.Accessory[] = [];
           // Elapsed time is its own accessory: at the end of the subtitle a long label cut it off.
           const ran = job ? elapsed(job, now) : "";
@@ -139,7 +140,10 @@ export default function Command() {
           }
           for (const s of host.services.filter((s) => s.status !== "up")) {
             accessories.push({
-              tag: { value: `${s.name} ${s.status}`, color: s.warn ? Color.Red : Color.Orange },
+              tag: {
+                value: `${s.name} ${s.status}`,
+                color: s.warn ? Color.Red : settled(s) ? Color.SecondaryText : Color.Orange,
+              },
               tooltip: s.text,
             });
           }
