@@ -7,6 +7,7 @@ import {
   Job,
   jobTitle,
   overdue,
+  settled,
   summarize,
   useFleetStatus,
 } from "./fleet";
@@ -121,7 +122,7 @@ export default function Command() {
         <MenuBarExtra.Section title="Fleet">
           {hosts.map((host) => {
             const bad = host.online === false || host.services.some((s) => s.warn);
-            const odd = host.services.some((s) => s.status !== "up");
+            const odd = host.services.some((s) => !settled(s));
             return (
               <MenuBarExtra.Item
                 key={host.name}

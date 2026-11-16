@@ -103,16 +103,19 @@ function unique(jobs: Job[]): Job[] {
 
 export type Problem = { level: "red" | "orange"; text: string };
 
-// What needs a look, worst first: an offline box or a service in trouble is red; a service held,
-// restoring or starting on purpose, and the server's own warnings (overdue jobs, untracked GPU
-// use) are orange. The server also warns about troubled services; those are listed once.
+// A service a running job took down on purpose (--takes-down) is not a problem: the job is.
+export const settled = (s: Service) => s.status === "up" || s.status === "held";
+
+// What needs a look, worst first: an offline box or a service in trouble is red; a service
+// restoring or starting, and the server's own warnings (overdue jobs, untracked GPU use) are
+// orange. A service a running job holds down is shown with that job, not here. The server also warns about troubled services; those are listed once.
 function attention(hosts: Host[], warnings: string[]): Problem[] {
   const out: Problem[] = [];
   const listed: string[] = [];
   for (const h of hosts) {
     if (h.online === false) out.push({ level: "red", text: `${h.name} is offline` });
     for (const s of h.services) {
-      if (s.status === "up") continue;
+      if (settled(s)) continue;
       out.push({ level: s.warn ? "red" : "orange", text: `${s.name}: ${s.text}` });
       listed.push(`${s.name} on ${h.name}: `);
     }
@@ -191,7 +194,7 @@ export function bookedLine(job: Job): string {
 
 export function hostLine(host: Host, now: number): string {
   if (host.online === false) return "OFFLINE";
-  const trouble = host.services.find((s) => s.status !== "up");
+  const trouble = host.services.find((s) => !settled(s));
   const job = host.running[0];
   const jobs = job ? jobLine(job, now) + (host.running.length > 1 ? ` (+${host.running.length - 1})` : "") : "";
   if (trouble) return [trouble.text, jobs].filter(Boolean).join(" · ");
